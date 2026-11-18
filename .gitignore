@@ -1,0 +1,26 @@
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Go
+*.exe
+*.out
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
