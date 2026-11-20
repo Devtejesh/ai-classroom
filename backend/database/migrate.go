@@ -19,7 +19,7 @@ func RunMigrations(db *sql.DB) error {
 		return fmt.Errorf("failed to create migration tracking table: %w", err)
 	}
 
-	files, err := filepath.Glob("database/migrations/*.up.sql")
+	files, err := filepath.Glob("../database/migrations/*.up.sql")
 	if err != nil {
 		return fmt.Errorf("failed to find migration files: %w", err)
 	}
