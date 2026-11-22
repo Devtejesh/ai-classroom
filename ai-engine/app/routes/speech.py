@@ -1,13 +1,12 @@
 
+import base64
 import logging
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-from starlette.concurrency import run_in_threadpool
-from io import BytesIO
+from fastapi.responses import Response
+from pydantic import BaseModel
 
-from app.services.speech import generate_speech
+from app.config import GEMINI_API_KEY, TTS_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -15,38 +14,114 @@ router = APIRouter()
 
 
 class SpeechRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=5000)
+    text: str
     voice: str = "Kore"
 
 
+def generate_speech(
+    text: str,
+    voice: str = "Kore",
+) -> bytes:
+
+    if not text or not text.strip():
+        raise ValueError("Text cannot be empty.")
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "Gemini TTS is not configured. "
+            "Add GEMINI_API_KEY to ai-engine/.env."
+        )
+
+    from google import genai
+
+    tts_client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options={"api_version": "v1beta"},
+    )
+
+    interaction = tts_client.interactions.create(
+        model=TTS_MODEL,
+        input=[
+            {
+                "type": "user_input",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": text.strip(),
+                        "annotations": [
+                            {
+                                "type": "speech_metadata",
+                                "style": (
+                                    "warm, friendly, clear "
+                                    "and natural teacher voice"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+        response_format={"type": "audio"},
+        generation_config={
+            "speech_config": [
+                {"voice": voice}
+            ]
+        },
+    )
+
+    audio_data = interaction.output_audio
+
+    if not audio_data or not audio_data.data:
+        raise RuntimeError("TTS returned empty audio.")
+
+    logger.info(
+        "TTS audio data type: %s",
+        type(audio_data.data)
+    )
+
+    logger.info(
+        "TTS audio data length: %s",
+        len(audio_data.data)
+    )
+
+    logger.info(
+        "TTS audio MIME type: %s",
+        getattr(audio_data, "mime_type", None)
+    )
+
+    audio_bytes = base64.b64decode(audio_data.data)
+
+    if not audio_bytes:
+        raise RuntimeError("Decoded audio is empty.")
+
+    return audio_bytes
+
+
+@router.post("/speech")
 @router.post("/tutor/speak")
-async def tutor_speak(request: SpeechRequest):
+async def create_speech(request: SpeechRequest):
 
     try:
-        audio_bytes = await run_in_threadpool(
-            generate_speech,
+        audio = generate_speech(
             request.text,
             request.voice,
         )
 
-        return StreamingResponse(
-            BytesIO(audio_bytes),
+        return Response(
+            content=audio,
             media_type="audio/wav",
-            headers={
-                "Content-Disposition": 'inline; filename="tutor.wav"'
-            },
         )
 
-    except ValueError as error:
+    except RuntimeError as error:
+        logger.exception("Speech generation configuration error")
         raise HTTPException(
-            status_code=400,
+            status_code=503,
             detail=str(error),
         )
 
     except Exception:
-        logger.exception("Tutor speech API failed.")
-
+        logger.exception("Speech generation failed")
         raise HTTPException(
-            status_code=502,
-            detail="Speech generation failed. Please try again.",
+            status_code=500,
+            detail="Speech generation failed.",
         )

@@ -2,16 +2,10 @@
 import json
 import logging
 import re
-import threading
-import time
 
-from google import genai
-
-from app.config import GEMINI_API_KEY, GEMINI_MODEL
+from app.services.ollama_client import generate_response
 
 logger = logging.getLogger(__name__)
-
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 SUPPORTED_LANGUAGES = {
     "hi": "Hindi",
@@ -19,121 +13,43 @@ SUPPORTED_LANGUAGES = {
     "te": "Telugu",
 }
 
-BATCH_SIZE = 10
-REQUEST_INTERVAL = 4.6
-
-_request_lock = threading.Lock()
-_last_request_time = 0.0
+BATCH_SIZE = 3
+MAX_RETRIES = 2
 
 
-class GeminiOutputError(Exception):
-    """Gemini returned an empty or invalid response."""
+def parse_model_response(response: str) -> list:
+    """Extract the first valid JSON array from Ollama response."""
 
+    cleaned = response.strip()
 
-class IncompleteTranslationError(Exception):
-    """Gemini did not translate every requested segment."""
-
-
-def get_error_status(error: Exception):
-    return (
-        getattr(error, "code", None)
-        or getattr(error, "status_code", None)
-    )
-
-
-def is_temporary_api_error(error: Exception) -> bool:
-    status_code = get_error_status(error)
-    error_text = str(error).upper()
-
-    return (
-        status_code in (429, 503)
-        or "429" in error_text
-        or "503" in error_text
-        or "RESOURCE_EXHAUSTED" in error_text
-        or "UNAVAILABLE" in error_text
-    )
-
-
-def generate_with_retry(prompt: str):
-    global _last_request_time
-
-    max_attempts = 5
-
-    for attempt in range(max_attempts):
-        try:
-            with _request_lock:
-                elapsed = time.monotonic() - _last_request_time
-
-                if elapsed < REQUEST_INTERVAL:
-                    time.sleep(REQUEST_INTERVAL - elapsed)
-
-                try:
-                    response = client.models.generate_content(
-                        model=GEMINI_MODEL,
-                        contents=prompt,
-                    )
-                finally:
-                    _last_request_time = time.monotonic()
-
-            return response
-
-        except Exception as error:
-            if not is_temporary_api_error(error):
-                raise
-
-            if attempt == max_attempts - 1:
-                logger.exception("Gemini API retries exhausted.")
-                raise
-
-            delay = min(5 * (2 ** attempt), 60)
-
-            logger.warning(
-                "Gemini temporary API error: %s. "
-                "Retrying in %s seconds (%s/%s).",
-                get_error_status(error),
-                delay,
-                attempt + 1,
-                max_attempts,
-            )
-
-            time.sleep(delay)
-
-    raise RuntimeError("Gemini request failed after retries")
-
-
-def parse_gemini_json(response):
-    if response is None:
-        raise GeminiOutputError("Gemini returned no response.")
-
-    response_text = getattr(response, "text", None)
-
-    if not response_text or not response_text.strip():
-        raise GeminiOutputError("Gemini returned an empty response.")
-
-    cleaned_text = response_text.strip()
-
-    # Handle JSON wrapped in Markdown code fences.
-    cleaned_text = re.sub(
+    # Remove Markdown code fences.
+    cleaned = re.sub(
         r"^```(?:json)?\s*",
         "",
-        cleaned_text,
+        cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
 
-    try:
-        result = json.loads(cleaned_text)
-    except json.JSONDecodeError as error:
-        raise GeminiOutputError(
-            "Gemini returned invalid JSON."
-        ) from error
+    decoder = json.JSONDecoder()
 
-    if not isinstance(result, list):
-        raise GeminiOutputError(
-            "Gemini response must be a JSON array."
-        )
+    # Find and decode the first complete JSON array.
+    for position, character in enumerate(cleaned):
+        if character != "[":
+            continue
 
-    return result
+        try:
+            result, _ = decoder.raw_decode(cleaned[position:])
+
+            if isinstance(result, list):
+                return result
+
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError(
+        "Ollama did not return a valid JSON array."
+    )
 
 
 def translate_batch(
@@ -142,120 +58,109 @@ def translate_batch(
     target_language: str,
 ) -> list[dict]:
 
+    source_name = SUPPORTED_LANGUAGES.get(
+        source_language,
+        source_language,
+    )
     target_name = SUPPORTED_LANGUAGES[target_language]
 
-    translated_texts = {}
-    pending_segments = list(enumerate(segments))
+    translated_segments = []
 
-    # Initial attempt + 2 retries for missing/invalid output.
-    for attempt in range(3):
-
-        if not pending_segments:
-            break
-
-        indexed_texts = [
-            {
-                "index": original_index,
-                "text": segment["text"],
-            }
-            for original_index, segment in pending_segments
-        ]
+    for segment in segments:
+        original_text = segment["text"]
 
         prompt = f"""
-You are a professional subtitle translator.
-
-Source language: {source_language}
-Target language: {target_name}
-
-Translate EVERY input segment into {target_name}.
+Translate the following text from {source_name} to {target_name}.
 
 Rules:
-- Translate every segment.
-- Do not skip any segment.
-- Do not combine segments.
-- Preserve every index exactly.
-- Return one translation for every input index.
-- Do not summarize.
-- Do not add explanations.
-- Return only a valid JSON array.
+1. Translate accurately and naturally.
+2. Preserve the original meaning.
+3. Return only the translated text.
+4. Do not explain anything.
+5. Do not return JSON or numbering.
 
-Input:
-{json.dumps(indexed_texts, ensure_ascii=False)}
+Text:
+{original_text}
 
-Required output format:
-[
-  {{"index": 0, "text": "translated text"}}
-]
+Translation:
 """
 
-        response = generate_with_retry(prompt)
+        translated_text = generate_response(prompt).strip()
 
+        if not translated_text:
+            raise ValueError("Ollama returned an empty translation.")
+
+        translated_segments.append({
+            **segment,
+            "text": translated_text,
+        })
+
+    return translated_segments
+
+
+
+def translate_with_fallback(
+    segments: list[dict],
+    source_language: str,
+    target_language: str,
+) -> list[dict]:
+    """Translate batches and preserve original text for failed segments."""
+
+    for attempt in range(MAX_RETRIES):
         try:
-            result = parse_gemini_json(response)
-        except GeminiOutputError:
-            logger.warning(
-                "Gemini returned empty/invalid JSON. Retry %s/2.",
+            translated = translate_batch(
+                segments,
+                source_language,
+                target_language,
+            )
+
+            return [
+                {**segment, "translation_status": "translated"}
+                for segment in translated
+            ]
+
+        except Exception:
+            logger.exception(
+                "Translation failed. Attempt %s/%s for %s segments.",
                 attempt + 1,
-            )
-            continue
-
-        for item in result:
-
-            if not isinstance(item, dict):
-                continue
-
-            index = item.get("index")
-            translated_text = item.get("text")
-
-            pending_indexes = {
-                original_index
-                for original_index, _ in pending_segments
-            }
-
-            if (
-                isinstance(index, int)
-                and isinstance(translated_text, str)
-                and translated_text.strip()
-                and index in pending_indexes
-            ):
-                translated_texts[index] = translated_text.strip()
-
-        pending_segments = [
-            (original_index, segment)
-            for original_index, segment in pending_segments
-            if original_index not in translated_texts
-        ]
-
-        if pending_segments:
-            logger.warning(
-                "Gemini missed %s segments. Retry %s/2.",
-                len(pending_segments),
-                attempt + 1,
+                MAX_RETRIES,
+                len(segments),
             )
 
-    if pending_segments:
-        # If no usable response was received, don't split the batch.
-        if not translated_texts:
-            raise GeminiOutputError(
-                "Gemini repeatedly returned empty or invalid output."
-            )
-
-        missing = [
-            index for index, _ in pending_segments
-        ]
-
-        raise IncompleteTranslationError(
-            f"Gemini missed translation segments: {missing}"
+    if len(segments) == 1:
+        logger.warning(
+            "Keeping original text for failed segment: %s",
+            segments[0].get("text", "")[:100],
         )
 
-    return [
-        {
-            "start": original["start"],
-            "end": original["end"],
-            "text": translated_texts[index],
-        }
-        for index, original in enumerate(segments)
-    ]
+        return [
+            {
+                **segments[0],
+                "translation_status": "untranslated",
+            }
+        ]
+
+    midpoint = len(segments) // 2
+
+    logger.warning(
+        "Splitting failed batch of %s segments.",
+        len(segments),
+    )
+
+    first_half = translate_with_fallback(
+        segments[:midpoint],
+        source_language,
+        target_language,
+    )
+
+    second_half = translate_with_fallback(
+        segments[midpoint:],
+        source_language,
+        target_language,
+    )
+
+    return first_half + second_half
+
 
 
 def translate_segments(
@@ -270,62 +175,19 @@ def translate_segments(
         )
 
     if not segments:
-        return []
+        raise ValueError("Transcript segments cannot be empty.")
 
     translated_segments = []
 
-    for batch_start in range(0, len(segments), BATCH_SIZE):
+    for start in range(0, len(segments), BATCH_SIZE):
+        batch = segments[start:start + BATCH_SIZE]
 
-        batch = segments[batch_start:batch_start + BATCH_SIZE]
+        translated_batch = translate_with_fallback(
+            batch,
+            source_language,
+            target_language,
+        )
 
-        try:
-            translated = translate_batch(
-                batch,
-                source_language,
-                target_language,
-            )
-
-            translated_segments.extend(translated)
-
-        except (GeminiOutputError, IncompleteTranslationError) as error:
-
-            # Do not split batches for empty/invalid responses.
-            if isinstance(error, GeminiOutputError):
-                raise
-
-            logger.warning(
-                "Incomplete translation in batch starting at %s. "
-                "Splitting batch.",
-                batch_start,
-            )
-
-            if len(batch) == 1:
-                raise
-
-            middle = len(batch) // 2
-
-            first_half = translate_segments(
-                batch[:middle],
-                source_language,
-                target_language,
-            )
-
-            second_half = translate_segments(
-                batch[middle:],
-                source_language,
-                target_language,
-            )
-
-            translated_segments.extend(first_half)
-            translated_segments.extend(second_half)
-
-        except Exception as error:
-
-            # 429 and 503 are temporary API problems.
-            # Never split batches for these errors.
-            if is_temporary_api_error(error):
-                raise
-
-            raise
+        translated_segments.extend(translated_batch)
 
     return translated_segments

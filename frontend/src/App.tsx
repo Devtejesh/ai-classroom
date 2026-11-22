@@ -1,5 +1,5 @@
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const API_URL = "http://localhost:8081/api";
@@ -109,6 +109,7 @@ function App() {
 
   const [activeTutorTab, setActiveTutorTab] = useState("Suggestions");
   const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -356,16 +357,15 @@ async function loadLesson(event: React.FormEvent<HTMLFormElement>) {
 
   try {
     const response = await fetch(
-      `${AI_ENGINE_URL}/youtube/process`,
+      `${AI_ENGINE_URL}/youtube/transcript`,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          url: videoUrl.trim(),
-          target_language: targetLanguage,
-        }),
+  url: videoUrl.trim(),
+}),
       }
     );
 
@@ -401,89 +401,140 @@ async function loadLesson(event: React.FormEvent<HTMLFormElement>) {
   }
 }
 
+async function sendMessage(text = chatInput) {
+  const value = text.trim();
 
-  function sendMessage(text = chatInput) {
-    const value = text.trim();
+  if (!value || chatLoading) return;
 
-    if (!value) return;
+  setMessages((previous) => [
+    ...previous,
+    { role: "user", text: value },
+  ]);
 
+  setChatInput("");
+  setChatNotice("AI Tutor is thinking...");
+  setChatLoading(true);
+
+  try {
+    const response = await fetch(`${AI_ENGINE_URL}/tutor`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        question: value,
+        segments: transcriptSegments,
+        target_language: getLanguageCode(language),
+      }),
+    });
+
+    const data: {
+      answer?: string;
+      detail?: string;
+    } = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.detail || "AI Tutor request failed.");
+    }
+
+    const answer = data.answer?.trim();
+
+    if (!answer) {
+      throw new Error("AI Tutor returned an empty answer.");
+    }
+
+    // Display AI Tutor answer
     setMessages((previous) => [
       ...previous,
-      { role: "user", text: value },
       {
         role: "assistant",
-        text: "Your AI Tutor interface is ready. Context-aware AI answers will be connected when we integrate the AI engine in the next phase.",
+        text: answer,
       },
     ]);
 
-    setChatInput("");
-    setChatNotice(
-      "AI response integration will be enabled in the AI phase."
+    // Automatically generate and play voice
+    await testTutorVoice(answer);
+
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error
+        ? error.message
+        : "Unable to connect to AI Tutor.";
+
+    setMessages((previous) => [
+      ...previous,
+      {
+        role: "assistant",
+        text: `Sorry, ${errorMessage}`,
+      },
+    ]);
+
+    setChatNotice("AI Tutor request failed.");
+  } finally {
+    setChatLoading(false);
+  }
+}
+
+
+async function testTutorVoice(text: string) {
+  setVoiceError("");
+  setChatNotice("");
+
+  if (voiceLoading || !text.trim()) return;
+
+  setVoiceLoading(true);
+
+  try {
+    const response = await fetch(
+      `${AI_ENGINE_URL}/tutor/speak`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          text: text.trim(),
+          voice: "Kore",
+        }),
+      }
     );
-  }
 
-  async function testTutorVoice() {
-    setVoiceError("");
-    setChatNotice("");
-
-    if (voiceLoading) return;
-
-    setVoiceLoading(true);
-
-    try {
-      const sampleText = getVoiceTestText(language);
-
-      const response = await fetch(
-        `${AI_ENGINE_URL}/tutor/speak`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            text: sampleText,
-            voice: "Kore",
-          }),
-        }
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `Speech API failed (${response.status}): ${errorText.slice(0, 300)}`
       );
-
-      if (!response.ok) {
-        const errorText = await response.text();
-
-        throw new Error(
-          `Speech API failed (${response.status}): ${errorText.slice(0, 300)}`
-        );
-      }
-
-      const blob = await response.blob();
-
-      // A WAV file needs more than its 44-byte header to contain audio.
-      if (blob.size <= 44) {
-        throw new Error(
-          "AI Engine returned an empty audio file. Please check the TTS service."
-        );
-      }
-
-      if (audioUrl) {
-        URL.revokeObjectURL(audioUrl);
-      }
-
-      const newAudioUrl = URL.createObjectURL(blob);
-
-      setAudioUrl(newAudioUrl);
-      setChatNotice(
-        `${language} tutor voice generated. Press Play to listen.`
-      );
-    } catch (error) {
-      setVoiceError(
-        error instanceof Error
-          ? error.message
-          : "Unable to generate tutor voice."
-      );
-    } finally {
-      setVoiceLoading(false);
     }
+
+    const blob = await response.blob();
+
+    if (blob.size <= 44) {
+      throw new Error("AI Engine returned an empty audio file.");
+    }
+
+    const newAudioUrl = URL.createObjectURL(blob);
+
+    if (audioUrl) {
+      URL.revokeObjectURL(audioUrl);
+    }
+
+    setAudioUrl(newAudioUrl);
+
+    const audio = new Audio(newAudioUrl);
+    await audio.play();
+
+    setChatNotice("AI Tutor is speaking...");
+  } catch (error) {
+    setVoiceError(
+      error instanceof Error
+        ? error.message
+        : "Unable to play tutor voice."
+    );
+  } finally {
+    setVoiceLoading(false);
   }
+}
+
 
   function saveNote() {
     if (!videoId) {
@@ -980,7 +1031,7 @@ async function loadLesson(event: React.FormEvent<HTMLFormElement>) {
                     <button
                       type="button"
                       className="small-primary"
-                      onClick={testTutorVoice}
+                      onClick={() => testTutorVoice(getVoiceTestText(language))}
                       disabled={voiceLoading}
                       style={{
                         width: "100%",

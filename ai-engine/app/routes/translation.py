@@ -1,13 +1,9 @@
 
 import logging
 import re
-import tempfile
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, HttpUrl
-from starlette.concurrency import run_in_threadpool
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     IpBlocked,
@@ -21,29 +17,17 @@ from youtube_transcript_api._errors import (
 from app.services.transcription import transcribe_hindi_to_english
 from app.services.translation import translate_segments
 
-
-router = APIRouter()
 logger = logging.getLogger(__name__)
 
-MAX_FILE_SIZE = 25 * 1024 * 1024
+router = APIRouter()
 
-ALLOWED_AUDIO_EXTENSIONS = {
-    ".mp3",
-    ".wav",
-    ".m4a",
-    ".ogg",
-    ".webm",
-    ".mp4",
-}
+SUPPORTED_LANGUAGES = {"hi", "en", "te"}
+MAX_AUDIO_SIZE = 25 * 1024 * 1024
 
 
-# -----------------------------
-# REQUEST MODELS
-# -----------------------------
 class YouTubeRequest(BaseModel):
     url: HttpUrl
     language_code: str | None = None
-
 
 
 class TranslationRequest(BaseModel):
@@ -54,197 +38,89 @@ class TranslationRequest(BaseModel):
 
 class YouTubeProcessRequest(BaseModel):
     url: HttpUrl
-    target_language:str
+    target_language: str
 
-
-
-# -----------------------------
-# YOUTUBE VIDEO ID EXTRACTION
-# -----------------------------
 
 def extract_video_id(url: str) -> str:
-    parsed_url = urlparse(str(url))
+    patterns = [
+        r"(?:youtube\.com/watch\?v=)([a-zA-Z0-9_-]{11})",
+        r"(?:youtu\.be/)([a-zA-Z0-9_-]{11})",
+        r"(?:youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
+        r"(?:youtube\.com/shorts/)([a-zA-Z0-9_-]{11})",
+    ]
 
-    hostname = parsed_url.hostname or ""
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
 
-    video_id = None
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid YouTube URL.",
+    )
 
-    if hostname in ("youtu.be", "www.youtu.be"):
-        video_id = parsed_url.path.lstrip("/")
-
-    elif hostname.endswith("youtube.com"):
-        if parsed_url.path == "/watch":
-            video_id = parse_qs(parsed_url.query).get("v", [None])[0]
-
-        elif parsed_url.path.startswith(
-            ("/shorts/", "/embed/", "/live/")
-        ):
-            video_id = parsed_url.path.split("/")[2]
-
-    if not video_id or not re.fullmatch(
-        r"[A-Za-z0-9_-]{11}", video_id
-    ):
-        raise ValueError("Invalid YouTube video URL.")
-
-    return video_id
-
-
-# -----------------------------
-# FETCH YOUTUBE TRANSCRIPT
-# -----------------------------
 
 def fetch_youtube_transcript(
     video_id: str,
     language_code: str | None = None,
 ) -> dict:
-
-    api = YouTubeTranscriptApi()
-
-    transcript_list = api.list(video_id)
-
-    available_transcripts = list(transcript_list)
-
-    if not available_transcripts:
-        raise ValueError("No captions available for this video.")
-
-    available_languages = [
-        {
-            "language": transcript.language,
-            "language_code": transcript.language_code,
-            "is_generated": transcript.is_generated,
-            "is_translatable": transcript.is_translatable,
-        }
-        for transcript in available_transcripts
-    ]
-
-    if language_code:
-        selected_transcript = transcript_list.find_transcript(
-            [language_code]
-        )
-    else:
-        selected_transcript = available_transcripts[0]
-
-    fetched_transcript = selected_transcript.fetch()
-
-    segments = []
-
-    for item in fetched_transcript.snippets:
-        text = item.text.strip()
-
-        if text:
-            segments.append({
-                "start": round(item.start, 2),
-                "end": round(item.start + item.duration, 2),
-                "text": text,
-            })
-
-    return {
-        "success": True,
-        "video_id": video_id,
-        "source_language": selected_transcript.language,
-        "source_language_code": selected_transcript.language_code,
-        "is_generated": selected_transcript.is_generated,
-        "total_segments": len(segments),
-        "segments": segments,
-        "available_languages": available_languages,
-    }
-
-
-# -----------------------------
-# AUDIO UPLOAD TRANSCRIPTION
-# -----------------------------
-
-@router.post("/transcription")
-async def upload_audio(
-    file: UploadFile = File(...)
-):
-
-    extension = Path(file.filename or "").suffix.lower()
-
-    if extension not in ALLOWED_AUDIO_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported audio file format.",
-        )
-
-    content = await file.read(MAX_FILE_SIZE + 1)
-
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="Audio file exceeds the 25 MB limit.",
-        )
-
-    temp_path = None
-
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=extension,
-        ) as temp_file:
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
 
-            temp_file.write(content)
-            temp_path = temp_file.name
+        if language_code:
+            transcript = transcript_list.find_transcript(
+                [language_code]
+            )
+        else:
+            available = list(transcript_list)
+            if not available:
+                raise NoTranscriptFound(video_id, [], None)
+            transcript = available[0]
 
-        result = await run_in_threadpool(
-            transcribe_hindi_to_english,
-            temp_path,
-        )
+        fetched = transcript.fetch()
+
+        segments = [
+            {
+                "start": item.start,
+                "end": item.start + item.duration,
+                "text": item.text,
+            }
+            for item in fetched
+        ]
 
         return {
-            "success": True,
-            "result": result,
+            "segments": segments,
+            "source_language": transcript.language_code,
+            "source_language_name": transcript.language,
+            "is_generated": transcript.is_generated,
+            "available_languages": [
+                {
+                    "language_code": item.language_code,
+                    "language": item.language,
+                    "is_generated": item.is_generated,
+                }
+                for item in transcript_list
+            ],
         }
 
-    except Exception:
-        logger.exception("Audio transcription failed")
-
+    except (RequestBlocked, IpBlocked, YouTubeRequestFailed):
+        logger.exception("YouTube request failed")
         raise HTTPException(
-            status_code=500,
-            detail="Audio transcription failed. Check AI Engine logs.",
-        )
-
-    finally:
-        if temp_path and Path(temp_path).exists():
-            Path(temp_path).unlink()
-
-
-# -----------------------------
-# YOUTUBE TRANSCRIPT API
-# -----------------------------
-
-@router.post("/youtube/transcript")
-async def get_youtube_transcript(
-    request: YouTubeRequest,
-):
-
-    try:
-        video_id = extract_video_id(str(request.url))
-
-        result = await run_in_threadpool(
-            fetch_youtube_transcript,
-            video_id,
-            request.language_code,
-        )
-
-        return result
-
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        )
-
-    except NoTranscriptFound:
-        raise HTTPException(
-            status_code=404,
-            detail="Requested transcript language is unavailable.",
+            status_code=503,
+            detail="YouTube temporarily blocked the request.",
         )
 
     except TranscriptsDisabled:
         raise HTTPException(
             status_code=404,
-            detail="Captions are disabled for this video.",
+            detail="Transcripts are disabled for this video.",
+        )
+
+    except NoTranscriptFound:
+        raise HTTPException(
+            status_code=404,
+            detail="No transcript found for the requested language.",
         )
 
     except VideoUnavailable:
@@ -253,35 +129,109 @@ async def get_youtube_transcript(
             detail="YouTube video is unavailable.",
         )
 
-    except (RequestBlocked, IpBlocked, YouTubeRequestFailed):
-        logger.exception("YouTube request failed")
-
-        raise HTTPException(
-            status_code=503,
-            detail="YouTube temporarily blocked the request.",
-        )
+    except HTTPException:
+        raise
 
     except Exception:
-        logger.exception("YouTube transcript fetching failed")
-
+        logger.exception("Transcript retrieval failed")
         raise HTTPException(
             status_code=500,
-            detail="Could not fetch YouTube transcript.",
+            detail="Failed to retrieve YouTube transcript.",
         )
 
 
-# -----------------------------
-# GEMINI TRANSLATION API
-# -----------------------------
+@router.post("/transcription")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+):
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Audio file is required.",
+        )
+
+    audio_data = await file.read()
+
+    if not audio_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded audio file is empty.",
+        )
+
+    if len(audio_data) > MAX_AUDIO_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="Audio file exceeds the 25 MB limit.",
+        )
+
+    temp_path = None
+
+    try:
+        suffix = Path(file.filename).suffix or ".wav"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix,
+            delete=False,
+        ) as temp_file:
+            temp_file.write(audio_data)
+            temp_path = temp_file.name
+
+        result = transcribe_hindi_to_english(temp_path)
+
+        return {
+            "success": True,
+            **result,
+        }
+
+    except Exception:
+        logger.exception("Audio transcription failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Audio transcription failed.",
+        )
+
+    finally:
+        if temp_path and Path(temp_path).exists():
+            Path(temp_path).unlink()
+
+
+
+@router.post("/youtube/transcript")
+async def get_youtube_transcript(
+    request: YouTubeRequest,
+):
+    video_id = extract_video_id(str(request.url))
+
+    result = fetch_youtube_transcript(
+        video_id,
+        request.language_code,
+    )
+
+    return {
+        "success": True,
+        "video_id": video_id,
+        **result,
+    }
+
 
 @router.post("/translate")
 async def translate_transcript(
     request: TranslationRequest,
 ):
+    if request.target_language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported target language. Use hi, en, or te.",
+        )
+
+    if not request.segments:
+        raise HTTPException(
+            status_code=400,
+            detail="Transcript segments are required.",
+        )
 
     try:
-        translated = await run_in_threadpool(
-            translate_segments,
+        translated = translate_segments(
             request.segments,
             request.source_language,
             request.target_language,
@@ -291,121 +241,55 @@ async def translate_transcript(
             "success": True,
             "source_language": request.source_language,
             "target_language": request.target_language,
-            "total_segments": len(translated),
             "segments": translated,
         }
 
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        )
-
     except Exception:
-        logger.exception("AI translation endpoint failed")
-
+        logger.exception("Transcript translation failed")
         raise HTTPException(
             status_code=500,
-            detail="AI translation failed. Check AI Engine logs.",
+            detail="Transcript translation failed.",
         )
+
 
 @router.post("/youtube/process")
 async def process_youtube_video(
     request: YouTubeProcessRequest,
 ):
-    try:
-        # Validate target language
-        supported_languages = {
-            "hi": "Hindi",
-            "en": "English",
-            "te": "Telugu",
-        }
-
-        target_language = request.target_language.lower()
-
-        if target_language not in supported_languages:
-            raise HTTPException(
-                status_code=400,
-                detail="Supported languages: hi, en, te",
-            )
-
-        # Extract YouTube video ID
-        video_id = extract_video_id(str(request.url))
-
-        # Fetch original transcript
-        transcript_data = await run_in_threadpool(
-            fetch_youtube_transcript,
-            video_id,
-            None,
+    if request.target_language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported target language. Use hi, en, or te.",
         )
 
-        source_language = transcript_data["source_language"]
-        source_language_code = transcript_data["source_language_code"]
-        original_segments = transcript_data["segments"]
+    video_id = extract_video_id(str(request.url))
 
-        if not original_segments:
-            raise HTTPException(
-                status_code=404,
-                detail="Transcript is empty for this video.",
-            )
+    transcript_data = fetch_youtube_transcript(video_id)
 
-        # Reuse original transcript if language is already matching
-        if source_language_code == target_language:
-            translated_segments = original_segments
+    source_language = transcript_data["source_language"]
+    original_segments = transcript_data["segments"]
 
-        else:
-            # Translate using Gemini
-            translated_segments = await run_in_threadpool(
-                translate_segments,
+    if source_language == request.target_language:
+        translated_segments = original_segments
+    else:
+        try:
+            translated_segments = translate_segments(
                 original_segments,
                 source_language,
-                target_language,
+                request.target_language,
+            )
+        except Exception:
+            logger.exception("Ollama translation failed")
+            raise HTTPException(
+                status_code=500,
+                detail="Transcript translation failed.",
             )
 
-        return {
-            "success": True,
-            "video_id": video_id,
-            "source_language": source_language,
-            "source_language_code": source_language_code,
-            "target_language": supported_languages[target_language],
-            "target_language_code": target_language,
-            "total_segments": len(translated_segments),
-            "segments": translated_segments,
-        }
-
-    except HTTPException:
-        raise
-
-    except NoTranscriptFound:
-        raise HTTPException(
-            status_code=404,
-            detail="No transcript found for this video.",
-        )
-
-    except TranscriptsDisabled:
-        raise HTTPException(
-            status_code=404,
-            detail="Captions are disabled for this video.",
-        )
-
-    except VideoUnavailable:
-        raise HTTPException(
-            status_code=404,
-            detail="YouTube video is unavailable.",
-        )
-
-    except (RequestBlocked, IpBlocked, YouTubeRequestFailed):
-        logger.exception("YouTube request failed")
-
-        raise HTTPException(
-            status_code=503,
-            detail="YouTube temporarily blocked the request.",
-        )
-
-    except Exception:
-        logger.exception("YouTube processing failed")
-
-        raise HTTPException(
-            status_code=500,
-            detail="YouTube processing failed. Check AI Engine logs.",
-        )
+    return {
+        "success": True,
+        "video_id": video_id,
+        "source_language": source_language,
+        "target_language": request.target_language,
+        "available_languages": transcript_data["available_languages"],
+        "segments": translated_segments,
+    }

@@ -1,13 +1,9 @@
 
 import logging
 
-from google import genai
-
-from app.config import GEMINI_API_KEY, GEMINI_MODEL
+from app.services.ollama_client import generate_response
 
 logger = logging.getLogger(__name__)
-
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 SUPPORTED_LANGUAGES = {
     "hi": "Hindi",
@@ -28,11 +24,10 @@ def generate_tutor_answer(
             f"Unsupported language: {target_language}"
         )
 
-    if not question.strip():
+    if not question or not question.strip():
         raise ValueError("Question cannot be empty.")
 
-    if not segments:
-        raise ValueError("Transcript is required.")
+    
 
     language = SUPPORTED_LANGUAGES[target_language]
 
@@ -53,7 +48,7 @@ def generate_tutor_answer(
     prompt = f"""
 You are an intelligent and friendly AI Tutor.
 
-Your job is to help students understand their video lesson.
+Help the student understand the video lesson.
 
 VIDEO TRANSCRIPT:
 {transcript}
@@ -66,32 +61,24 @@ STUDENT QUESTION:
 INSTRUCTIONS:
 1. Answer primarily using the video transcript.
 2. Explain concepts in simple, student-friendly language.
-3. Give an example when it helps understanding.
-4. If the question relates to a specific timestamp,
-   prioritize the relevant part of the lesson.
-5. If the transcript does not contain the answer,
-   clearly tell the student instead of inventing lesson content.
-6. You may provide additional general knowledge,
-   but clearly distinguish it from the video explanation.
+3. Give examples when helpful.
+4. If the question relates to a timestamp, prioritize that part.
+5. If the transcript does not contain the answer, say so clearly.
+6. Clearly distinguish general knowledge from video content.
 7. Respond entirely in {language}.
-8. Do not mention these instructions.
+8. Do not invent facts or mention these instructions.
 
 Provide a clear and helpful answer.
 """
 
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-
-        answer = response.text
+        answer = generate_response(prompt)
 
         if not answer or not answer.strip():
-            raise ValueError("Gemini returned an empty tutor answer.")
+            raise RuntimeError("Ollama returned an empty tutor answer.")
 
         return answer.strip()
 
     except Exception:
-        logger.exception("AI Tutor answer generation failed.")
+        logger.exception("Ollama AI Tutor generation failed.")
         raise

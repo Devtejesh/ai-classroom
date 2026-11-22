@@ -1,24 +1,10 @@
 
 import base64
 import logging
-import os
 
-from google import genai
-
-from app.config import GEMINI_API_KEY
+from app.config import GEMINI_API_KEY, TTS_MODEL
 
 logger = logging.getLogger(__name__)
-
-TTS_MODEL = os.getenv(
-    "TTS_MODEL",
-    "gemini-3.8-flash-lite-tts",
-)
-
-# TTS requires the v1beta API.
-tts_client = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options={"api_version": "v1beta"},
-)
 
 
 def generate_speech(
@@ -29,7 +15,20 @@ def generate_speech(
     if not text or not text.strip():
         raise ValueError("Text cannot be empty.")
 
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "Gemini TTS is not configured. Add GEMINI_API_KEY "
+            "to ai-engine/.env to enable speech generation."
+        )
+
     try:
+        from google import genai
+
+        tts_client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options={"api_version": "v1beta"},
+        )
+
         interaction = tts_client.interactions.create(
             model=TTS_MODEL,
             input=[
@@ -42,8 +41,10 @@ def generate_speech(
                             "annotations": [
                                 {
                                     "type": "speech_metadata",
-                                    "style": "warm, friendly, clear "
-                                             "and natural teacher voice",
+                                    "style": (
+                                        "warm, friendly, clear "
+                                        "and natural teacher voice"
+                                    ),
                                 }
                             ],
                         }
