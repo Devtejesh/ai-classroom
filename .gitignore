@@ -24,3 +24,5 @@ venv/
 
 # Logs
 *.log
+
+ai-engine/test_speech.wav
