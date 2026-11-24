@@ -183,6 +183,110 @@ func (h *AuthHandler) VerifyOTP(c *gin.Context) {
 	})
 }
 
+type ForgotPasswordRequest struct {
+	Email string `json:"email" binding:"required,email"`
+}
+
+func (h *AuthHandler) ForgotPassword(c *gin.Context) {
+	var req ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid email is required"})
+		return
+	}
+
+	user, err := h.UserService.GetUserByEmail(c.Request.Context(), req.Email)
+	if err != nil {
+		if errors.Is(err, repositories.ErrUserNotFound) {
+			c.JSON(http.StatusOK, gin.H{
+				"message": "If the account exists, a password reset OTP will be sent.",
+			})
+			return
+		}
+
+		log.Printf("password reset user lookup error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to process request"})
+		return
+	}
+
+	if user.IsVerified {
+		if err := h.OTPService.SendOTP(
+			c.Request.Context(),
+			user.ID,
+			user.Email,
+		); err != nil {
+			log.Printf("password reset OTP delivery error: %v", err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "failed to send reset OTP"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "If the account exists, a password reset OTP will be sent.",
+	})
+}
+
+type ResetPasswordRequest struct {
+	Email       string `json:"email" binding:"required,email"`
+	OTP         string `json:"otp" binding:"required,len=6"`
+	NewPassword string `json:"new_password" binding:"required,min=8"`
+}
+
+func (h *AuthHandler) ResetPassword(c *gin.Context) {
+	var req ResetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "valid email, six-digit OTP, and password of at least 8 characters are required",
+		})
+		return
+	}
+
+	user, err := h.UserService.GetUserByEmail(c.Request.Context(), req.Email)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid reset request"})
+		return
+	}
+
+	if !user.IsVerified {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email must be verified"})
+		return
+	}
+
+	if err := h.OTPService.VerifyOTP(
+		c.Request.Context(),
+		user.ID,
+		req.OTP,
+	); err != nil {
+		switch {
+		case errors.Is(err, services.ErrOTPExpired):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "OTP expired. Request a new one."})
+		case errors.Is(err, services.ErrOTPMaxAttempts):
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "maximum OTP attempts exceeded. Request a new one."})
+		case errors.Is(err, services.ErrInvalidOTP):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "incorrect OTP"})
+		case errors.Is(err, repositories.ErrOTPNotFound):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "OTP not found. Request a new one."})
+		default:
+			log.Printf("password reset OTP verification error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "password reset verification failed"})
+		}
+		return
+	}
+
+	if err := h.UserService.UpdatePassword(
+		c.Request.Context(),
+		user.ID,
+		req.NewPassword,
+	); err != nil {
+		log.Printf("password update error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update password"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Password reset successful. You can now log in with your new password.",
+	})
+}
+
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req models.LoginRequest
 

@@ -3,7 +3,7 @@ import json
 import logging
 import re
 
-from app.services.ollama_client import generate_response
+from app.services.llm import generate_response
 
 logger = logging.getLogger(__name__)
 

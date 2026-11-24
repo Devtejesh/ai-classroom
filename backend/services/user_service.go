@@ -135,3 +135,29 @@ func (s *UserService) GetUserByEmail(
 
 	return s.UserRepo.GetByEmail(ctx, email)
 }
+
+func (s *UserService) UpdatePassword(
+	ctx context.Context,
+	userID int64,
+	newPassword string,
+) error {
+	newPassword = strings.TrimSpace(newPassword)
+
+	if userID <= 0 || len(newPassword) < 8 {
+		return ErrInvalidUserData
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword(
+		[]byte(newPassword),
+		bcrypt.DefaultCost,
+	)
+	if err != nil {
+		return errors.New("failed to hash new password")
+	}
+
+	return s.UserRepo.UpdatePassword(
+		ctx,
+		userID,
+		string(passwordHash),
+	)
+}

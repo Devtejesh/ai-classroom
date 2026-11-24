@@ -1,6 +1,10 @@
-
 import { useEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import "./App.css";
+import ReactMarkdown from "react-markdown";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 
 const API_URL = "http://localhost:8081/api";
 const AI_ENGINE_URL = "http://localhost:8000/api";
@@ -14,11 +18,33 @@ type User = {
 };
 
 type AuthMode = "login" | "register";
+
 type Page = "Home" | "My Learning" | "Library" | "Analytics" | "Settings";
 
 type ChatMessage = {
   role: "user" | "assistant";
   text: string;
+};
+
+type ViewMode = "both" | "video" | "chat";
+
+type TranscriptSegment = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+type SavedNote = {
+  id: number;
+  user_id?: number;
+  session_id: number;
+  title: string;
+  content: string;
+  is_shared: boolean;
+  share_token?: string;
+  shared_at?: string;
+  created_at: string;
+  updated_at: string;
 };
 
 const SUPPORTED_LANGUAGES = ["English", "Telugu", "Hindi"];
@@ -50,39 +76,64 @@ function getYouTubeId(url: string): string | null {
 }
 
 function getLanguageCode(language: string): string {
-  const languageMap: Record<string, string> = {
+  const languageCodes: Record<string, string> = {
     English: "en",
     Telugu: "te",
     Hindi: "hi",
   };
 
-  return languageMap[language] || "en";
+  return languageCodes[language] || "en";
 }
 
-function getVoiceTestText(language: string): string {
-  const samples: Record<string, string> = {
-    English:
-      "Hello! Welcome to AI Classroom. I am your personal AI tutor. Let's learn something new today.",
+/* Browser Speech Recognition types */
 
-    Telugu:
-      "నమస్కారం! ఏఐ క్లాస్‌రూమ్‌కు స్వాగతం. నేను మీ వ్యక్తిగత ఏఐ టీచర్‌ని. ఈరోజు కొత్త విషయాలు నేర్చుకుందాం.",
-
-    Hindi:
-      "नमस्ते! एआई क्लासरूम में आपका स्वागत है। मैं आपका व्यक्तिगत एआई शिक्षक हूँ। आइए आज कुछ नया सीखते हैं।",
+type SpeechRecognitionResultLike = {
+  0: {
+    transcript: string;
   };
+};
 
-  return samples[language] || samples.English;
+type SpeechRecognitionEventLike = {
+  results: ArrayLike<SpeechRecognitionResultLike>;
+};
+
+type SpeechRecognitionLike = {
+  lang: string;
+  interimResults: boolean;
+  maxAlternatives: number;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  }
 }
 
 function App() {
   const [page, setPage] = useState<Page>("Home");
-  const [authMode, setAuthMode] = useState<AuthMode>("login");
-  const [showAuth, setShowAuth] = useState(false);
+
+  const [authMode, setAuthMode] = useState<AuthMode>("register");
+  const [showAuth, setShowAuth] = useState(
+    () => !localStorage.getItem("ai_classroom_token"),
+  );
   const [otpStep, setOtpStep] = useState(false);
+  const [passwordResetStep, setPasswordResetStep] = useState(false);
+const [resetOTP, setResetOTP] = useState("");
+const [newPassword, setNewPassword] = useState("");
+
   const [otp, setOtp] = useState("");
   const [user, setUser] = useState<User | null>(null);
+
   const [token, setToken] = useState(
-    localStorage.getItem("ai_classroom_token") || ""
+    localStorage.getItem("ai_classroom_token") || "",
   );
 
   const [authLoading, setAuthLoading] = useState(false);
@@ -94,68 +145,123 @@ function App() {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
 
+  /* Video states */
+
   const [videoUrl, setVideoUrl] = useState("");
   const [videoId, setVideoId] = useState("");
+  const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
+
   const [transcriptSegments, setTranscriptSegments] = useState<
-  Array<{ start: number; end: number; text: string }>
->([]);
+    TranscriptSegment[]
+  >([]);
+
   const [videoError, setVideoError] = useState("");
 
   const [language, setLanguage] = useState("English");
 
-  const [tutorName, setTutorName] = useState(
-    localStorage.getItem("ai_tutor_name") || "Your AI Tutor"
-  );
+  const [viewMode, setViewMode] = useState<ViewMode>("both");
 
-  const [activeTutorTab, setActiveTutorTab] = useState("Suggestions");
+  /* Chat states */
+
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
-      text: "Hello! I'm here to help you understand your lessons. What would you like to learn today?",
+      text: "Hello! I'm your AI tutor. Ask me anything about your lesson.",
     },
   ]);
 
   const [chatNotice, setChatNotice] = useState("");
-  const [savedNotes, setSavedNotes] = useState<string[]>([]);
-  const [history, setHistory] = useState<string[]>([]);
 
-  // AI Tutor voice states
+  /* Learning states */
+
+  const [history, setHistory] = useState<string[]>([]);
+  const [savedNotes, setSavedNotes] = useState<SavedNote[]>([]);
+
+  const [noteTitle, setNoteTitle] = useState("");
+  const [noteContent, setNoteContent] = useState("");
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [notesError, setNotesError] = useState("");
+  const [tutorName, setTutorName] = useState(
+    localStorage.getItem("ai_tutor_name") || "Your AI Tutor",
+  );
+
+  /* Voice states */
+
   const [voiceLoading, setVoiceLoading] = useState(false);
   const [voiceError, setVoiceError] = useState("");
   const [audioUrl, setAudioUrl] = useState("");
+
+  const [isListening, setIsListening] = useState(false);
+
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  /* Load user profile */
 
   useEffect(() => {
     if (!token) return;
 
     fetch(`${API_URL}/auth/profile`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     })
       .then(async (response) => {
-        if (!response.ok) throw new Error("Session expired");
+        if (!response.ok) {
+          throw new Error("Session expired");
+        }
 
         const data = await response.json();
+
         setUser(data.user || data);
       })
       .catch(() => {
         localStorage.removeItem("ai_classroom_token");
         setToken("");
         setUser(null);
+        setShowAuth(true);
       });
   }, [token]);
 
-  // Release old audio URLs when replaced or component unmounts.
+  /* Automatically scroll chat */
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "end",
+    });
+  }, [messages, chatLoading]);
+
+  /* Load saved notes whenever the Library page is opened */
+  useEffect(() => {
+    if (page !== "Library" || !token) return;
+
+    fetchSavedNotes().catch((error) => {
+      setNotesError(
+        error instanceof Error ? error.message : "Unable to load saved notes.",
+      );
+    });
+  }, [page, token]);
+
+  /* Cleanup audio and microphone */
+
   useEffect(() => {
     return () => {
+      recognitionRef.current?.stop();
+
       if (audioUrl) {
         URL.revokeObjectURL(audioUrl);
       }
     };
   }, [audioUrl]);
 
-  async function handleAuth(event: React.FormEvent<HTMLFormElement>) {
+  /* Authentication */
+
+  async function handleAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     setAuthError("");
@@ -180,7 +286,9 @@ function App() {
 
       const response = await fetch(`${API_URL}${endpoint}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(payload),
       });
 
@@ -190,62 +298,63 @@ function App() {
         throw new Error(
           data.error ||
             data.message ||
-            "Authentication failed. Please try again."
+            "Authentication failed. Please try again.",
         );
       }
 
       if (authMode === "register") {
         setOtp("");
         setOtpStep(true);
-        setAuthMessage(
-          data.message || "Verification OTP sent to your email."
-        );
+
+        setAuthMessage(data.message || "Verification OTP sent to your email.");
+
         setPassword("");
+
         return;
       }
 
-      const newToken = data.token;
-
-      if (!newToken) {
+      if (!data.token) {
         throw new Error("Login response did not contain a JWT token.");
       }
 
-      localStorage.setItem("ai_classroom_token", newToken);
+      localStorage.setItem("ai_classroom_token", data.token);
 
-      setToken(newToken);
-      setUser(data.user || {
-        name: email.split("@")[0],
-        email,
-      });
+      setToken(data.token);
+
+      setUser(
+        data.user || {
+          name: email.split("@")[0],
+          email,
+        },
+      );
 
       setShowAuth(false);
       setPassword("");
     } catch (error) {
       setAuthError(
-        error instanceof Error
-          ? error.message
-          : "Something went wrong."
+        error instanceof Error ? error.message : "Something went wrong.",
       );
     } finally {
       setAuthLoading(false);
     }
   }
 
-  async function resendOTP() {
+
+  /* Forgot Password */
+
+  async function handleForgotPassword() {
     setAuthError("");
     setAuthMessage("");
 
     if (!email.trim()) {
-      setAuthError(
-        "Please enter your registered email address first."
-      );
+      setAuthError("Please enter your registered email address.");
       return;
     }
 
     setAuthLoading(true);
 
     try {
-      const response = await fetch(`${API_URL}/auth/send-otp`, {
+      const response = await fetch(`${API_URL}/auth/forgot-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email.trim() }),
@@ -254,28 +363,123 @@ function App() {
       const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        throw new Error(
-          data.error || data.message || "Unable to send OTP."
-        );
+        throw new Error(data.error || data.message || "Unable to send reset OTP.");
       }
 
-      setOtp("");
-      setOtpStep(true);
+      setResetOTP("");
+      setNewPassword("");
+      setPasswordResetStep(true);
       setAuthMessage(
-        data.message || "A new verification OTP has been sent."
+        data.message || "If your account is eligible, a password reset OTP has been sent."
       );
     } catch (error) {
       setAuthError(
-        error instanceof Error
-          ? error.message
-          : "Unable to send OTP."
+        error instanceof Error ? error.message : "Unable to send OTP."
       );
     } finally {
       setAuthLoading(false);
     }
   }
 
-  async function verifyOTP(event: React.FormEvent<HTMLFormElement>) {
+  /* Reset Password */
+
+  async function handleResetPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    setAuthError("");
+    setAuthMessage("");
+
+    if (!/^\d{6}$/.test(resetOTP)) {
+      setAuthError("Please enter a valid 6-digit OTP.");
+      return;
+    }
+
+    if (newPassword.length < 8) {
+      setAuthError("New password must contain at least 8 characters.");
+      return;
+    }
+
+    setAuthLoading(true);
+
+    try {
+      const response = await fetch(`${API_URL}/auth/reset-password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: email.trim(),
+          otp: resetOTP,
+          new_password: newPassword,
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data.error || data.message || "Password reset failed.");
+      }
+
+      setPasswordResetStep(false);
+      setResetOTP("");
+      setNewPassword("");
+      setPassword("");
+      setAuthMode("login");
+
+      setAuthMessage(data.message || "Password reset successful. Please log in.");
+    } catch (error) {
+      setAuthError(
+        error instanceof Error ? error.message : "Password reset failed."
+      );
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  /* Resend OTP */
+
+  async function resendOTP() {
+    setAuthError("");
+    setAuthMessage("");
+
+    if (!email.trim()) {
+      setAuthError("Please enter your registered email address first.");
+      return;
+    }
+
+    setAuthLoading(true);
+
+    try {
+      const response = await fetch(`${API_URL}/auth/send-otp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email: email.trim(),
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data.error || data.message || "Unable to send OTP.");
+      }
+
+      setOtp("");
+      setOtpStep(true);
+
+      setAuthMessage(data.message || "A new verification OTP has been sent.");
+    } catch (error) {
+      setAuthError(
+        error instanceof Error ? error.message : "Unable to send OTP.",
+      );
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  /* Verify OTP */
+
+  async function verifyOTP(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     setAuthError("");
@@ -291,7 +495,9 @@ function App() {
     try {
       const response = await fetch(`${API_URL}/auth/verify-otp`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           email: email.trim(),
           otp,
@@ -302,7 +508,7 @@ function App() {
 
       if (!response.ok) {
         throw new Error(
-          data.error || data.message || "OTP verification failed."
+          data.error || data.message || "OTP verification failed.",
         );
       }
 
@@ -310,184 +516,131 @@ function App() {
       setOtp("");
       setAuthMode("login");
       setPassword("");
-      setAuthError("");
 
       setAuthMessage(
-        data.message ||
-          "Email verified successfully. You can now log in."
+        data.message || "Email verified successfully. You can now log in.",
       );
     } catch (error) {
       setAuthError(
-        error instanceof Error
-          ? error.message
-          : "OTP verification failed."
+        error instanceof Error ? error.message : "OTP verification failed.",
       );
     } finally {
       setAuthLoading(false);
     }
   }
 
+  /* Logout */
+
   function logout() {
     localStorage.removeItem("ai_classroom_token");
 
     setToken("");
     setUser(null);
-    setShowAuth(false);
+    setSavedNotes([]);
+    setShowAuth(true);
+    setAuthMode("register");
     setPage("Home");
   }
 
-async function loadLesson(event: React.FormEvent<HTMLFormElement>) {
-  event.preventDefault();
+  /* Load YouTube lesson */
 
-  setVideoError("");
+  async function loadLesson(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
 
-  const id = getYouTubeId(videoUrl.trim());
+    setVideoError("");
 
-  if (!id) {
-    setVideoError("Please enter a valid YouTube video URL.");
-    return;
-  }
+    const id = getYouTubeId(videoUrl.trim());
 
-  setVideoId(id);
-  setTranscriptSegments([]);
+    if (!id) {
+      setVideoError("Please enter a valid YouTube video URL.");
+      return;
+    }
 
-  const targetLanguage =
-    language === "Telugu" ? "te" :
-    language === "Hindi" ? "hi" : "en";
+    setVideoId(id);
+    setCurrentSessionId(null);
+    setTranscriptSegments([]);
 
-  try {
-    const response = await fetch(
-      `${AI_ENGINE_URL}/youtube/transcript`,
-      {
+    setChatNotice("Preparing lesson transcript...");
+
+    try {
+      const response = await fetch(`${AI_ENGINE_URL}/youtube/transcript`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-  url: videoUrl.trim(),
-}),
+          url: videoUrl.trim(),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail || "Unable to process this YouTube lesson.",
+        );
       }
-    );
 
-    const data = await response.json();
+      if (!data.success || !Array.isArray(data.segments)) {
+        throw new Error("Transcript was not returned by AI Engine.");
+      }
 
-    if (!response.ok) {
-      throw new Error(
-        data.detail || "Unable to process this YouTube lesson."
+      // Create a new learning session in PostgreSQL.
+      const sessionResponse = await fetch(`${API_URL}/learning/sessions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          video_id: id,
+          video_title: data.title || `YouTube lesson (${id})`,
+        }),
+      });
+
+      const sessionData = await sessionResponse.json();
+
+      if (!sessionResponse.ok) {
+        throw new Error(
+          sessionData.error || "Failed to create learning session.",
+        );
+      }
+
+      setCurrentSessionId(sessionData.session.id);
+      setTranscriptSegments(data.segments);
+
+      setHistory((previous) => [
+        `YouTube lesson – ${new Date().toLocaleDateString()}`,
+        ...previous,
+      ]);
+
+      setChatNotice(
+        `Lesson transcript ready in ${language}. Ask your tutor a question.`,
       );
+    } catch (error) {
+      setVideoError(
+        error instanceof Error
+          ? error.message
+          : "Unable to load lesson transcript.",
+      );
+
+      setChatNotice("");
     }
-
-    if (!data.success || !Array.isArray(data.segments)) {
-      throw new Error("Transcript was not returned by AI Engine.");
-    }
-
-    setTranscriptSegments(data.segments);
-
-    setHistory((previous) => [
-      `YouTube lesson – ${new Date().toLocaleDateString()}`,
-      ...previous,
-    ]);
-
-    setChatNotice(
-      `Lesson transcript ready in ${language}. You can ask your AI Tutor questions.`
-    );
-
-  } catch (error) {
-    setVideoError(
-      error instanceof Error
-        ? error.message
-        : "Unable to load lesson transcript."
-    );
   }
-}
 
-async function sendMessage(text = chatInput) {
-  const value = text.trim();
+  /* Gemini text-to-speech */
 
-  if (!value || chatLoading) return;
+  async function testTutorVoice(text: string) {
+    setVoiceError("");
 
-  setMessages((previous) => [
-    ...previous,
-    { role: "user", text: value },
-  ]);
-
-  setChatInput("");
-  setChatNotice("AI Tutor is thinking...");
-  setChatLoading(true);
-
-  try {
-    const response = await fetch(`${AI_ENGINE_URL}/tutor`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        question: value,
-        segments: transcriptSegments,
-        target_language: getLanguageCode(language),
-      }),
-    });
-
-    const data: {
-      answer?: string;
-      detail?: string;
-    } = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.detail || "AI Tutor request failed.");
+    if (voiceLoading || !text.trim()) {
+      return;
     }
 
-    const answer = data.answer?.trim();
+    setVoiceLoading(true);
 
-    if (!answer) {
-      throw new Error("AI Tutor returned an empty answer.");
-    }
-
-    // Display AI Tutor answer
-    setMessages((previous) => [
-      ...previous,
-      {
-        role: "assistant",
-        text: answer,
-      },
-    ]);
-
-    // Automatically generate and play voice
-    await testTutorVoice(answer);
-
-  } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : "Unable to connect to AI Tutor.";
-
-    setMessages((previous) => [
-      ...previous,
-      {
-        role: "assistant",
-        text: `Sorry, ${errorMessage}`,
-      },
-    ]);
-
-    setChatNotice("AI Tutor request failed.");
-  } finally {
-    setChatLoading(false);
-  }
-}
-
-
-async function testTutorVoice(text: string) {
-  setVoiceError("");
-  setChatNotice("");
-
-  if (voiceLoading || !text.trim()) return;
-
-  setVoiceLoading(true);
-
-  try {
-    const response = await fetch(
-      `${AI_ENGINE_URL}/tutor/speak`,
-      {
+    try {
+      const response = await fetch(`${AI_ENGINE_URL}/tutor/speak`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -496,78 +649,408 @@ async function testTutorVoice(text: string) {
           text: text.trim(),
           voice: "Kore",
         }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+
+        throw new Error(
+          `Speech API failed (${response.status}): ${errorText.slice(0, 300)}`,
+        );
       }
-    );
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(
-        `Speech API failed (${response.status}): ${errorText.slice(0, 300)}`
+      const blob = await response.blob();
+
+      if (blob.size <= 44) {
+        throw new Error("AI Engine returned an empty audio file.");
+      }
+
+      const newAudioUrl = URL.createObjectURL(blob);
+
+      setAudioUrl((oldUrl) => {
+        if (oldUrl) {
+          URL.revokeObjectURL(oldUrl);
+        }
+
+        return newAudioUrl;
+      });
+
+      const audio = new Audio(newAudioUrl);
+
+      await audio.play();
+    } catch (error) {
+      setVoiceError(
+        error instanceof Error ? error.message : "Unable to play tutor voice.",
       );
+    } finally {
+      setVoiceLoading(false);
     }
-
-    const blob = await response.blob();
-
-    if (blob.size <= 44) {
-      throw new Error("AI Engine returned an empty audio file.");
-    }
-
-    const newAudioUrl = URL.createObjectURL(blob);
-
-    if (audioUrl) {
-      URL.revokeObjectURL(audioUrl);
-    }
-
-    setAudioUrl(newAudioUrl);
-
-    const audio = new Audio(newAudioUrl);
-    await audio.play();
-
-    setChatNotice("AI Tutor is speaking...");
-  } catch (error) {
-    setVoiceError(
-      error instanceof Error
-        ? error.message
-        : "Unable to play tutor voice."
-    );
-  } finally {
-    setVoiceLoading(false);
   }
-}
 
+  /* Send question to AI Tutor */
 
-  function saveNote() {
-    if (!videoId) {
-      setChatNotice("Load a lesson first to save lesson notes.");
+  async function sendMessage(text = chatInput) {
+    const value = text.trim();
+
+    if (!value || chatLoading) {
       return;
     }
 
-    setSavedNotes((previous) => [
-      `Notes for lesson ${videoId} – ${new Date().toLocaleString()}`,
+    setMessages((previous) => [
       ...previous,
+      {
+        role: "user",
+        text: value,
+      },
     ]);
 
-    setChatNotice("Lesson note saved in this session.");
+    setChatInput("");
+    setChatNotice("AI Tutor is thinking...");
+    setChatLoading(true);
+
+    try {
+      const response = await fetch(`${AI_ENGINE_URL}/tutor`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          question: value,
+          segments: transcriptSegments,
+          target_language: getLanguageCode(language),
+        }),
+      });
+
+      const data: {
+        answer?: string;
+        detail?: string;
+      } = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "AI Tutor request failed.");
+      }
+
+      const answer = data.answer?.trim();
+
+      if (!answer) {
+        throw new Error("AI Tutor returned an empty answer.");
+      }
+
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          text: answer,
+        },
+      ]);
+
+      setChatNotice("");
+
+      await testTutorVoice(answer);
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error
+          ? error.message
+          : "Unable to connect to AI Tutor.";
+
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          text: `Sorry, ${errorMessage}`,
+        },
+      ]);
+
+      setChatNotice("AI Tutor request failed.");
+    } finally {
+      setChatLoading(false);
+    }
   }
+
+  async function generateLessonNotes() {
+    if (!currentSessionId || !transcriptSegments.length) {
+      setNotesError("Load a lesson before generating notes.");
+      return;
+    }
+
+    setNotesLoading(true);
+    setNotesError("");
+
+    try {
+      const response = await fetch(`${AI_ENGINE_URL}/tutor`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          question:
+            "Create comprehensive, well-structured study notes for this entire video. Include a suitable title, key concepts, detailed explanations, important points, and practical examples. Use clear Markdown formatting. Do not answer as a conversation; prepare notes for a student to revise later.",
+          segments: transcriptSegments,
+          target_language: getLanguageCode(language),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Unable to generate lesson notes.");
+      }
+
+      if (!data.answer?.trim()) {
+        throw new Error("AI Tutor returned empty notes.");
+      }
+
+      setNoteTitle(`Lesson Notes - ${videoId}`);
+      setNoteContent(data.answer.trim());
+    } catch (error) {
+      setNotesError(
+        error instanceof Error
+          ? error.message
+          : "Failed to generate lesson notes.",
+      );
+    } finally {
+      setNotesLoading(false);
+    }
+  }
+
+  /* Voice input */
+
+  function startVoiceInput() {
+    const Recognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    if (!Recognition) {
+      setVoiceError(
+        "Speech recognition is not supported in this browser. Please use Chrome or Edge.",
+      );
+      return;
+    }
+
+    setVoiceError("");
+
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const recognition = new Recognition();
+
+    const languageCode = getLanguageCode(language);
+
+    recognition.lang =
+      languageCode === "te"
+        ? "te-IN"
+        : languageCode === "hi"
+          ? "hi-IN"
+          : "en-IN";
+
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = (event) => {
+      let transcript = "";
+
+      for (let index = 0; index < event.results.length; index += 1) {
+        transcript += event.results[index][0].transcript;
+      }
+
+      setChatInput(transcript);
+    };
+
+    recognition.onerror = () => {
+      setIsListening(false);
+
+      setVoiceError(
+        "Microphone input failed. Check browser microphone permission.",
+      );
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+    };
+
+    recognitionRef.current = recognition;
+
+    try {
+      recognition.start();
+      setIsListening(true);
+    } catch {
+      setIsListening(false);
+
+      setVoiceError("Could not start microphone input. Please try again.");
+    }
+  }
+
+  /* Fetch saved notes from PostgreSQL */
+  async function fetchSavedNotes() {
+    if (!token) {
+      setSavedNotes([]);
+      return;
+    }
+
+    const response = await fetch(`${API_URL}/learning/notes`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        data.error || data.message || "Unable to load saved notes.",
+      );
+    }
+
+    const notes = Array.isArray(data)
+      ? data
+      : Array.isArray(data.notes)
+        ? data.notes
+        : Array.isArray(data.data)
+          ? data.data
+          : [];
+
+    setSavedNotes(notes);
+  }
+
+  /* Save lesson note */
+  async function saveNote() {
+    if (!token) {
+      setNotesError("Please login to save notes.");
+      return;
+    }
+
+    if (!currentSessionId) {
+      setNotesError("Load a lesson before saving notes.");
+      return;
+    }
+
+    if (!noteTitle.trim() || !noteContent.trim()) {
+      setNotesError("Please enter a note title and content.");
+      return;
+    }
+
+    setNotesError("");
+
+    try {
+      const response = await fetch(`${API_URL}/learning/notes`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          session_id: currentSessionId,
+          title: noteTitle.trim(),
+          content: noteContent.trim(),
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data.error || data.message || "Failed to save notes.");
+      }
+
+      // Reload the actual saved note records from the backend.
+      await fetchSavedNotes();
+
+      setNotesError("");
+      setChatNotice("Notes saved successfully!");
+    } catch (error) {
+      setNotesError(
+        error instanceof Error ? error.message : "Unable to save notes.",
+      );
+    }
+  }
+  /* Download notes as Unicode-friendly TXT or printable PDF */
+  function downloadNoteAsText(title: string, content: string) {
+    const blob = new Blob(["\uFEFF", content], {
+      type: "text/plain;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${title.trim() || "lesson-notes"}.txt`.replace(/[\\/:*?"<>|]/g, "-");
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadNoteAsPDF(title: string, content: string) {
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      setNotesError("Please allow pop-ups to save notes as PDF.");
+      return;
+    }
+
+    const escapeHTML = (value: string) =>
+      value.replace(/[&<>"']/g, (character) => {
+        const entities: Record<string, string> = {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        };
+        return entities[character];
+      });
+
+    printWindow.document.open();
+    printWindow.document.write(`<!DOCTYPE html>
+      <html lang="en">
+        <head>
+          <meta charset="UTF-8" />
+          <title>${escapeHTML(title || "Lesson Notes")}</title>
+          <style>
+            @page { size: A4; margin: 20mm; }
+            body {
+              font-family: "Noto Sans Telugu", "Noto Sans Devanagari",
+                "Nirmala UI", "Lohit Telugu", Arial, sans-serif;
+              color: #171717;
+              line-height: 1.65;
+              font-size: 12pt;
+            }
+            h1 { font-size: 20pt; margin: 0 0 18px; }
+            .content { white-space: pre-wrap; overflow-wrap: anywhere; }
+          </style>
+        </head>
+        <body>
+          <h1>${escapeHTML(title || "Lesson Notes")}</h1>
+          <div class="content">${escapeHTML(content)}</div>
+          <script>window.onload = () => { window.focus(); window.print(); };</script>
+        </body>
+      </html>`);
+    printWindow.document.close();
+  }
+
+  /* Update tutor name */
 
   function changeTutorName(value: string) {
     setTutorName(value);
+
     localStorage.setItem("ai_tutor_name", value);
   }
 
-  const navItems: { label: Page; icon: string }[] = [
+  /* Navigation */
+
+  const navItems: {
+    label: Page;
+    icon: string;
+  }[] = [
     { label: "Home", icon: "⌂" },
     { label: "My Learning", icon: "▷" },
     { label: "Library", icon: "▤" },
     { label: "Analytics", icon: "▥" },
   ];
 
+  /* Authentication screen */
+
   if (showAuth) {
     return (
       <div className="auth-screen">
-        <div className="auth-glow auth-glow-one" />
-        <div className="auth-glow auth-glow-two" />
-
         <button
           className="auth-back"
           onClick={() => {
@@ -581,21 +1064,21 @@ async function testTutorVoice(text: string) {
         </button>
 
         <div className="auth-card">
-          <div className="brand-mark auth-brand-mark">✧</div>
           <div className="brand-title">AI CLASSROOM</div>
+
           <p className="brand-subtitle">Learn · Understand · Grow</p>
 
           {otpStep ? (
             <>
               <div className="auth-heading">
                 <span className="eyebrow">EMAIL VERIFICATION</span>
+
                 <h1>Verify Your Email</h1>
-                <p>
-                  Enter the 6-digit verification code sent to {email}.
-                </p>
+
+                <p>Enter the 6-digit verification code sent to {email}.</p>
               </div>
 
-              <form className="auth-form otp-form" onSubmit={verifyOTP}>
+              <form className="auth-form" onSubmit={verifyOTP}>
                 <label>
                   6-digit OTP
                   <input
@@ -606,9 +1089,7 @@ async function testTutorVoice(text: string) {
                     maxLength={6}
                     value={otp}
                     onChange={(event) =>
-                      setOtp(
-                        event.target.value.replace(/\D/g, "").slice(0, 6)
-                      )
+                      setOtp(event.target.value.replace(/\D/g, "").slice(0, 6))
                     }
                     placeholder="Enter 6-digit OTP"
                     required
@@ -636,9 +1117,7 @@ async function testTutorVoice(text: string) {
                 onClick={resendOTP}
                 disabled={authLoading}
               >
-                {authLoading
-                  ? "Please wait..."
-                  : "Didn't receive the code? Resend OTP"}
+                Didn't receive the code? Resend OTP
               </button>
 
               <button
@@ -654,17 +1133,82 @@ async function testTutorVoice(text: string) {
                 Back to Login
               </button>
             </>
+          ) : passwordResetStep ? (
+            <>
+              <div className="auth-heading">
+                <span className="eyebrow">ACCOUNT RECOVERY</span>
+                <h1>Reset Password</h1>
+                <p>Enter the OTP sent to {email} and choose a new password.</p>
+              </div>
+
+              <form className="auth-form" onSubmit={handleResetPassword}>
+                <label>
+                  6-digit OTP
+                  <input
+                    className="otp-input"
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    maxLength={6}
+                    value={resetOTP}
+                    onChange={(event) =>
+                      setResetOTP(event.target.value.replace(/\\D/g, "").slice(0, 6))
+                    }
+                    placeholder="Enter 6-digit OTP"
+                    required
+                  />
+                </label>
+
+                <label>
+                  New password
+                  <input
+                    type="password"
+                    value={newPassword}
+                    onChange={(event) => setNewPassword(event.target.value)}
+                    placeholder="Enter new password"
+                    minLength={8}
+                    required
+                  />
+                </label>
+
+                {authError && (
+                  <div className="form-alert error">{authError}</div>
+                )}
+
+                {authMessage && (
+                  <div className="form-alert success">{authMessage}</div>
+                )}
+
+                <button
+                  className="primary-button auth-submit"
+                  disabled={authLoading}
+                >
+                  {authLoading ? "Resetting..." : "Reset Password →"}
+                </button>
+              </form>
+
+              <button
+                className="otp-back-button"
+                type="button"
+                onClick={() => {
+                  setPasswordResetStep(false);
+                  setResetOTP("");
+                  setNewPassword("");
+                  setAuthError("");
+                  setAuthMessage("");
+                  setAuthMode("login");
+                }}
+              >
+                Back to Login
+              </button>
+            </>
           ) : (
             <>
               <div className="auth-heading">
-                <span className="eyebrow">
-                  YOUR PERSONAL LEARNING SPACE
-                </span>
+                <span className="eyebrow">YOUR PERSONAL LEARNING SPACE</span>
 
                 <h1>
-                  {authMode === "login"
-                    ? "Welcome Back!"
-                    : "Create Account"}
+                  {authMode === "login" ? "Welcome Back!" : "Create Account"}
                 </h1>
 
                 <p>
@@ -737,15 +1281,23 @@ async function testTutorVoice(text: string) {
 
                     <button
                       type="button"
-                      onClick={() =>
-                        setShowPassword((value) => !value)
-                      }
-                      aria-label="Toggle password visibility"
+                      onClick={() => setShowPassword((value) => !value)}
                     >
                       {showPassword ? "Hide" : "Show"}
                     </button>
                   </div>
                 </label>
+
+                {authMode === "login" && (
+                  <div className="forgot-password">
+                    <button
+                      type="button"
+                      onClick={handleForgotPassword}
+                    >
+                      Forgot Password?
+                    </button>
+                  </div>
+                )}
 
                 {authError && (
                   <div className="form-alert error">{authError}</div>
@@ -787,6 +1339,8 @@ async function testTutorVoice(text: string) {
     );
   }
 
+  /* Main application */
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -796,9 +1350,7 @@ async function testTutorVoice(text: string) {
           {navItems.map((item) => (
             <button
               key={item.label}
-              className={`nav-item ${
-                page === item.label ? "selected" : ""
-              }`}
+              className={`nav-item ${page === item.label ? "selected" : ""}`}
               onClick={() => setPage(item.label)}
             >
               <span className="nav-icon">{item.icon}</span>
@@ -809,7 +1361,7 @@ async function testTutorVoice(text: string) {
 
         <div className="sidebar-bottom">
           <button
-            className="nav-item"
+            className={`nav-item ${page === "Settings" ? "selected" : ""}`}
             onClick={() => setPage("Settings")}
           >
             <span className="nav-icon">⚙</span>
@@ -825,9 +1377,8 @@ async function testTutorVoice(text: string) {
 
             <div>
               <div className="brand-title">AI CLASSROOM</div>
-              <div className="brand-subtitle">
-                Learn · Understand · Grow
-              </div>
+
+              <div className="brand-subtitle">Learn · Understand · Grow</div>
             </div>
           </div>
 
@@ -847,7 +1398,7 @@ async function testTutorVoice(text: string) {
             {user ? (
               <button
                 className="user-avatar"
-                title={user.name}
+                title={`${user.name} — log out`}
                 onClick={logout}
               >
                 {user.name?.charAt(0).toUpperCase() || "U"}
@@ -881,30 +1432,9 @@ async function testTutorVoice(text: string) {
         <main className="workspace">
           {page === "Home" && (
             <>
-              <section className="welcome-row">
-                <div>
-                  <span className="eyebrow">
-                    YOUR PERSONAL LEARNING SPACE
-                  </span>
-
-                  <h1>
-                    Welcome{" "}
-                    <span>
-                      {user?.name
-                        ? user.name.split(" ")[0]
-                        : "Back"}
-                      !
-                    </span>
-                  </h1>
-
-                  <p>
-                    Your personalized AI learning companion is ready to
-                    help you learn better.
-                  </p>
-                </div>
-
+              <section className="classroom-toolbar">
                 <label className="language-select">
-                  <span>◎</span>
+                  <span>Language</span>
 
                   <select
                     value={language}
@@ -913,334 +1443,363 @@ async function testTutorVoice(text: string) {
                       setAudioUrl("");
                       setVoiceError("");
                     }}
-                    aria-label="Preferred language"
                   >
                     {SUPPORTED_LANGUAGES.map((item) => (
                       <option key={item}>{item}</option>
                     ))}
                   </select>
                 </label>
+
+                <div className="view-mode-switch" aria-label="Classroom layout">
+                  <button
+                    className={viewMode === "both" ? "active" : ""}
+                    onClick={() => setViewMode("both")}
+                  >
+                    Video + Chat
+                  </button>
+
+                  <button
+                    className={viewMode === "video" ? "active" : ""}
+                    onClick={() => setViewMode("video")}
+                  >
+                    Video Only
+                  </button>
+
+                  <button
+                    className={viewMode === "chat" ? "active" : ""}
+                    onClick={() => setViewMode("chat")}
+                  >
+                    Chat Only
+                  </button>
+                </div>
               </section>
 
-              <section className="classroom-grid">
-                <div className="lesson-column">
-                  <div className="video-panel">
-                    {videoId ? (
-                      <iframe
-                        className="youtube-frame"
-                        src={`https://www.youtube-nocookie.com/embed/${videoId}`}
-                        title="YouTube learning video"
-                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                        allowFullScreen
-                      />
-                    ) : (
-                      <div className="empty-video">
-                        <div className="large-orbit">✧</div>
-                        <h3>Your learning universe starts here</h3>
-                        <p>Paste a YouTube lesson below to begin.</p>
-                      </div>
-                    )}
-                  </div>
-
-                  <form
-                    className="lesson-input-panel"
-                    onSubmit={loadLesson}
-                  >
-                    <div className="play-icon">▷</div>
-
-                    <div className="lesson-input-content">
-                      <label htmlFor="youtube-url">
-                        ADD A YOUTUBE LESSON
-                      </label>
-
-                      <div className="lesson-input-row">
-                        <input
-                          id="youtube-url"
-                          value={videoUrl}
-                          onChange={(event) =>
-                            setVideoUrl(event.target.value)
-                          }
-                          placeholder="Paste your YouTube video URL here..."
+              <section className={`classroom-layout mode-${viewMode}`}>
+                {viewMode !== "chat" && (
+                  <section className="lesson-column">
+                    <div className="video-panel">
+                      {videoId ? (
+                        <iframe
+                          className="youtube-frame"
+                          src={`https://www.youtube-nocookie.com/embed/${videoId}`}
+                          title="YouTube learning video"
+                          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                          allowFullScreen
                         />
-
-                        <button className="primary-button">
-                          Load lesson ↗
-                        </button>
-                      </div>
-
-                      {videoError && (
-                        <p className="inline-error">{videoError}</p>
-                      )}
-                    </div>
-                  </form>
-
-                  <div className="audio-tools">
-                    <div>
-                      <span className="eyebrow">
-                        LEARNING LANGUAGE
-                      </span>
-                      <strong>{language}</strong>
-                    </div>
-
-                    <div className="audio-status">
-                      <span className="status-dot" />
-                      AI Tutor voice is available for testing
-                    </div>
-                  </div>
-                </div>
-
-                <aside className="tutor-panel">
-                  <div className="panel-heading">
-                    <span className="eyebrow">
-                      YOUR AI COMPANION
-                    </span>
-
-                    <span className="ready-status">
-                      <i /> READY
-                    </span>
-                  </div>
-
-                  <div className="tutor-portrait">
-                    <img
-                      src="ai-tutor.png"
-                      alt="AI Classroom tutor"
-                    />
-
-                    <div className="tutor-greeting">
-                      <strong>Hello! 👋</strong>
-                      <p>
-                        I'm here to help you learn. What shall we
-                        explore today?
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="tutor-name">
-                    {tutorName} ✧
-                  </div>
-
-                  <p className="tutor-caption">
-                    Your AI Learning Companion
-                  </p>
-
-                  {/* AI Tutor voice test */}
-                  <div
-                    className="tutor-voice-test"
-                    style={{ margin: "12px 0" }}
-                  >
-                    <button
-                      type="button"
-                      className="small-primary"
-                      onClick={() => testTutorVoice(getVoiceTestText(language))}
-                      disabled={voiceLoading}
-                      style={{
-                        width: "100%",
-                        padding: "11px",
-                        cursor: voiceLoading ? "wait" : "pointer",
-                      }}
-                    >
-                      {voiceLoading
-                        ? "Generating voice..."
-                        : "🔊 Test Tutor Voice"}
-                    </button>
-
-                    {voiceError && (
-                      <p
-                        className="inline-error"
-                        style={{ marginTop: "8px" }}
-                      >
-                        {voiceError}
-                      </p>
-                    )}
-
-                    {audioUrl && (
-                      <div style={{ marginTop: "10px" }}>
-                        <audio
-                          controls
-                          src={audioUrl}
-                          style={{ width: "100%" }}
-                        >
-                          Your browser does not support audio playback.
-                        </audio>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="tutor-tabs">
-                    {["Suggestions", "Notes", "Practice"].map(
-                      (tab) => (
-                        <button
-                          key={tab}
-                          className={
-                            activeTutorTab === tab ? "active" : ""
-                          }
-                          onClick={() => setActiveTutorTab(tab)}
-                        >
-                          {tab === "Suggestions"
-                            ? "✧"
-                            : tab === "Notes"
-                              ? "▤"
-                              : "♧"}{" "}
-                          {tab}
-                        </button>
-                      )
-                    )}
-                  </div>
-
-                  {activeTutorTab === "Suggestions" && (
-                    <div className="suggestion-list">
-                      {[
-                        "Explain this topic in simple words",
-                        "Summarize this lesson",
-                        "Give me practice questions",
-                      ].map((prompt) => (
-                        <button
-                          key={prompt}
-                          onClick={() => sendMessage(prompt)}
-                        >
-                          <span>✧</span>
-                          {prompt}
-                          <b>›</b>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-
-                  {activeTutorTab === "Notes" && (
-                    <div className="tutor-content-list">
-                      <button onClick={saveNote}>
-                        ＋ Save current lesson note
-                      </button>
-
-                      {savedNotes.length === 0 ? (
-                        <p>No saved notes in this session yet.</p>
                       ) : (
-                        savedNotes.map((note, index) => (
-                          <p key={index}>▤ {note}</p>
-                        ))
+                        <div className="empty-video">
+                          <span className="empty-video-icon">▶</span>
+
+                          <p>
+                            Paste a YouTube lesson link below to start learning.
+                          </p>
+                        </div>
                       )}
                     </div>
-                  )}
 
-                  {activeTutorTab === "Practice" && (
-                    <div className="tutor-content-list">
-                      <p>Practice tools for your current lesson.</p>
+                    <form className="lesson-input-panel" onSubmit={loadLesson}>
+                      <label className="lesson-input-content">
+                        <span>YOUTUBE LESSON URL</span>
+
+                        <div className="lesson-input-row">
+                          <input
+                            value={videoUrl}
+                            onChange={(event) =>
+                              setVideoUrl(event.target.value)
+                            }
+                            placeholder="Paste your YouTube video URL here..."
+                            aria-label="YouTube video URL"
+                          />
+
+                          <button className="primary-button">
+                            Load lesson
+                          </button>
+                        </div>
+
+                        {videoError && (
+                          <p className="inline-error">{videoError}</p>
+                        )}
+                      </label>
+                    </form>
+                  </section>
+                )}
+
+                {viewMode !== "video" && (
+                  <section className="chat-panel" aria-label="AI Tutor chat">
+                    <header className="chat-header">
+                      <div>
+                        <h2>{tutorName}</h2>
+
+                        <span className="chat-online">
+                          <i /> Ready to help
+                        </span>
+                      </div>
 
                       <button
-                        onClick={() =>
-                          sendMessage(
-                            "Create a short quiz for this lesson"
-                          )
-                        }
-                      >
-                        Generate a lesson quiz ↗
-                      </button>
+                        className="clear-chat-button"
+                        onClick={() => {
+                          setMessages([
+                            {
+                              role: "assistant",
+                              text: "Hello! I'm your AI tutor. Ask me anything about your lesson.",
+                            },
+                          ]);
 
-                      <button
-                        onClick={() =>
-                          sendMessage(
-                            "Ask me five practice questions"
-                          )
-                        }
+                          setChatNotice("");
+                        }}
                       >
-                        Five practice questions ↗
+                        New chat
                       </button>
+                    </header>
+
+                    <div className="chat-messages" aria-live="polite">
+                      {" "}
+                      {messages.map((message, index) => (
+                        <article
+                          key={`${index}-${message.role}`}
+                          className={`chat-message ${
+                            message.role === "user"
+                              ? "user-message"
+                              : "assistant-message"
+                          }`}
+                        >
+                          <span className="message-role">
+                            {message.role === "user" ? "You" : "AI Tutor"}
+                          </span>
+
+                          <div className="message-text">
+                            {message.role === "user" ? (
+                              <div>{message.text}</div>
+                            ) : (
+                              <ReactMarkdown
+                                remarkPlugins={[remarkMath]}
+                                rehypePlugins={[rehypeKatex]}
+                              >
+                                {message.text}
+                              </ReactMarkdown>
+                            )}
+                          </div>
+                        </article>
+                      ))}
+                      {chatLoading && (
+                        <article className="chat-message assistant-message">
+                          <span className="message-role">AI Tutor</span>
+
+                          <div className="typing-indicator">
+                            <i />
+                            <i />
+                            <i />
+                          </div>
+                        </article>
+                      )}
+                      <div ref={messagesEndRef} />
                     </div>
-                  )}
 
-                  <div className="chat-messages">
-                    {messages.slice(-3).map((message, index) => (
+                    {(chatNotice || voiceError) && (
                       <div
-                        key={index}
-                        className={`chat-message ${
-                          message.role === "user"
-                            ? "user-message"
-                            : ""
+                        className={`chat-status ${
+                          voiceError ? "error-text" : ""
                         }`}
                       >
-                        {message.text}
+                        {voiceError || chatNotice}
                       </div>
-                    ))}
-                  </div>
+                    )}
 
-                  {chatNotice && (
-                    <p className="chat-notice">{chatNotice}</p>
-                  )}
+                    <form
+                      className="chat-input-row"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        sendMessage();
+                      }}
+                    >
+                      <input
+                        value={chatInput}
+                        onChange={(event) => setChatInput(event.target.value)}
+                        placeholder="Ask your question..."
+                        aria-label="Message your AI tutor"
+                      />
 
-                  <form
-                    className="chat-input-row"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      sendMessage();
-                    }}
-                  >
-                    <input
-                      value={chatInput}
-                      onChange={(event) =>
-                        setChatInput(event.target.value)
-                      }
-                      placeholder="Ask Your AI Tutor anything..."
-                    />
+                      <button
+                        type="button"
+                        className={`mic-button ${
+                          isListening ? "listening" : ""
+                        }`}
+                        onClick={startVoiceInput}
+                        title={
+                          isListening
+                            ? "Stop voice input"
+                            : "Speak your question"
+                        }
+                        aria-label={
+                          isListening ? "Stop voice input" : "Start voice input"
+                        }
+                      >
+                        🎙
+                      </button>
 
-                    <button aria-label="Send message">➤</button>
-                  </form>
-                </aside>
+                      <button
+                        className="send-button"
+                        aria-label="Send message"
+                        disabled={!chatInput.trim() || chatLoading}
+                      >
+                        ➤
+                      </button>
+                    </form>
+
+                    <div className="chat-footer">
+                      <span>
+                        {isListening
+                          ? "Listening… speak now"
+                          : `Responses in ${language}`}
+                      </span>
+
+                      <span>{voiceLoading ? "Preparing voice…" : ""}</span>
+                    </div>
+
+                    {audioUrl && (
+                      <audio className="chat-audio" controls src={audioUrl}>
+                        Your browser does not support audio playback.
+                      </audio>
+                    )}
+                  </section>
+                )}
               </section>
             </>
           )}
 
           {page !== "Home" && (
             <section className="secondary-page">
-              <span className="eyebrow">
-                AI CLASSROOM WORKSPACE
-              </span>
+              <span className="eyebrow">AI CLASSROOM</span>
 
               <h1>{page}</h1>
 
               {page === "My Learning" && (
                 <div className="content-card">
-                  <h3>Your learning journey</h3>
-                  <p>
-                    Lessons you have opened in this session appear here.
-                  </p>
+                  <h3>Your learning history</h3>
 
                   {history.length ? (
                     history.map((item, index) => (
                       <div className="history-item" key={index}>
-                        ▷ {item}
+                        {item}
                       </div>
                     ))
                   ) : (
-                    <p>
-                      No lessons yet. Go to Home and load a YouTube
-                      lesson.
-                    </p>
+                    <p>No lessons yet. Go to Home and load a YouTube lesson.</p>
                   )}
                 </div>
               )}
-
               {page === "Library" && (
-                <div className="content-card">
-                  <h3>Your learning library</h3>
-                  <p>
-                    Your saved notes and learning resources will be
-                    organized here.
-                  </p>
+                <div className="content-card notes-workspace">
+                  <h3>Lesson Notes</h3>
 
+                  <div className="notes-editor">
+                    <input
+                      type="text"
+                      value={noteTitle}
+                      onChange={(e) => setNoteTitle(e.target.value)}
+                      placeholder="Enter note title"
+                    />
+
+                    <button
+                      className="secondary-button"
+                      onClick={generateLessonNotes}
+                      disabled={notesLoading}
+                    >
+                      {notesLoading
+                        ? "Generating Notes..."
+                        : "✨ Generate AI Notes"}
+                    </button>
+
+                    {notesError && (
+                      <p className="error-message">{notesError}</p>
+                    )}
+
+                    <textarea
+                      value={noteContent}
+                      onChange={(e) => setNoteContent(e.target.value)}
+                      placeholder="Write your notes here or generate them using AI..."
+                      rows={18}
+                    />
+
+                    <section className="notes-preview-section">
+                      <div className="notes-preview-heading">
+                        <h3>Notes Preview</h3>
+                        <span>Formatted reading view</span>
+                      </div>
+
+                      <div className="notes-preview">
+                        {noteContent.trim() ? (
+                          <ReactMarkdown
+                            remarkPlugins={[remarkMath]}
+                            rehypePlugins={[rehypeKatex]}
+                          >
+                            {noteContent}
+                          </ReactMarkdown>
+                        ) : (
+                          <p className="notes-preview-placeholder">
+                            Your formatted notes will appear here as you type or generate them.
+                          </p>
+                        )}
+                      </div>
+                    </section>
+
+                    <button className="primary-button" onClick={saveNote}>
+                      Save Notes
+                    </button>
+                    <div className="notes-download-actions">
+                      <button
+                        className="secondary-button"
+                        onClick={() => downloadNoteAsText(noteTitle, noteContent)}
+                        disabled={!noteTitle.trim() || !noteContent.trim()}
+                      >
+                        Download TXT
+                      </button>
+                      <button
+                        className="secondary-button"
+                        onClick={() => downloadNoteAsPDF(noteTitle, noteContent)}
+                        disabled={!noteTitle.trim() || !noteContent.trim()}
+                      >
+                        Save as PDF
+                      </button>
+                    </div>
+                  </div>
+
+                  <hr />
+
+                  <h3>Saved Notes</h3>
                   {savedNotes.length ? (
-                    savedNotes.map((item, index) => (
-                      <div className="history-item" key={index}>
-                        ▤ {item}
+                    savedNotes.map((item) => (
+                      <div className="saved-note-item" key={item.id}>
+                        <h4>{item.title}</h4>
+                        <div className="saved-note-content">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkMath]}
+                            rehypePlugins={[rehypeKatex]}
+                          >
+                            {item.content}
+                          </ReactMarkdown>
+                        </div>
+                        <div className="notes-download-actions">
+                          <button
+                            className="secondary-button"
+                            onClick={() => downloadNoteAsText(item.title, item.content)}
+                          >
+                            Download TXT
+                          </button>
+                          <button
+                            className="secondary-button"
+                            onClick={() => downloadNoteAsPDF(item.title, item.content)}
+                          >
+                            Save as PDF
+                          </button>
+                        </div>
                       </div>
                     ))
                   ) : (
-                    <p>
-                      Your library is waiting for your first saved note.
-                    </p>
+                    <p>No saved notes yet.</p>
                   )}
                 </div>
               )}
-
               {page === "Analytics" && (
                 <div className="stats-grid">
                   <div className="stat-card">
@@ -1257,20 +1816,23 @@ async function testTutorVoice(text: string) {
                     <span>Learning language</span>
                     <strong>{language}</strong>
                   </div>
+
+                  <div className="stat-card">
+                    <span>Chat messages</span>
+                    <strong>{messages.length}</strong>
+                  </div>
                 </div>
               )}
 
               {page === "Settings" && (
                 <div className="content-card settings-card">
-                  <h3>Personalize your classroom</h3>
+                  <h3>Settings</h3>
 
                   <label>
                     AI Tutor name
                     <input
                       value={tutorName}
-                      onChange={(event) =>
-                        changeTutorName(event.target.value)
-                      }
+                      onChange={(event) => changeTutorName(event.target.value)}
                     />
                   </label>
 
@@ -1278,11 +1840,7 @@ async function testTutorVoice(text: string) {
                     Preferred learning language
                     <select
                       value={language}
-                      onChange={(event) => {
-                        setLanguage(event.target.value);
-                        setAudioUrl("");
-                        setVoiceError("");
-                      }}
+                      onChange={(event) => setLanguage(event.target.value)}
                     >
                       {SUPPORTED_LANGUAGES.map((item) => (
                         <option key={item}>{item}</option>
@@ -1295,12 +1853,10 @@ async function testTutorVoice(text: string) {
                       <p>
                         Signed in as <strong>{user.name}</strong>
                       </p>
+
                       <p>{user.email}</p>
 
-                      <button
-                        className="secondary-button"
-                        onClick={logout}
-                      >
+                      <button className="secondary-button" onClick={logout}>
                         Log out
                       </button>
                     </div>

@@ -154,3 +154,31 @@ func (r *UserRepository) GetByID(
 
 	return &user, nil
 }
+
+func (r *UserRepository) UpdatePassword(
+	ctx context.Context,
+	userID int64,
+	passwordHash string,
+) error {
+	result, err := r.DB.ExecContext(
+		ctx,
+		`UPDATE users
+                 SET password_hash = $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $2`,
+		passwordHash,
+		userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update password: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check password update: %w", err)
+	}
+	if rows == 0 {
+		return ErrUserNotFound
+	}
+
+	return nil
+}
