@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"net/http"
 
+	// "ai-classroom/backend/monitoring"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -16,6 +18,7 @@ func NewHealthHandler(db *sql.DB) *HealthHandler {
 }
 
 func (h *HealthHandler) Check(c *gin.Context) {
+	// monitoring.HttpRequestsTotal.Inc()
 	if err := h.DB.PingContext(c.Request.Context()); err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"status":   "unhealthy",

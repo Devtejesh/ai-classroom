@@ -5,6 +5,7 @@ import (
 
 	"ai-classroom/backend/config"
 	"ai-classroom/backend/database"
+	"ai-classroom/backend/middleware"
 	"ai-classroom/backend/repositories"
 	"ai-classroom/backend/routes"
 	"ai-classroom/backend/services"
@@ -48,6 +49,7 @@ func main() {
 	)
 
 	router := gin.Default()
+	router.Use(middleware.MetricsMiddleware())
 	router.SetTrustedProxies(nil)
 	router.Use(func(c *gin.Context) {
 		origin := c.Request.Header.Get("Origin")

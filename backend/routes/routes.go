@@ -9,6 +9,7 @@ import (
 	"ai-classroom/backend/services"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func SetupRoutes(
@@ -17,6 +18,9 @@ func SetupRoutes(
 	jwtService *services.JWTService,
 	otpService *services.OTPService,
 ) {
+
+	//Prometheus Metrics Endpoint
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 	// Health Handler
 	healthHandler := handlers.NewHealthHandler(db)
 
