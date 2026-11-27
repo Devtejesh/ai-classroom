@@ -19,33 +19,33 @@ func SetupRoutes(
 	otpService *services.OTPService,
 ) {
 
-	//Prometheus Metrics Endpoint
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
-	// Health Handler
+
 	healthHandler := handlers.NewHealthHandler(db)
 
-	// User Repository and Service
 	userRepository := repositories.NewUserRepository(db)
 	userService := services.NewUserService(userRepository)
 
-	// Authentication Handler
 	authHandler := handlers.NewAuthHandler(
 		userService,
 		jwtService,
 		otpService,
 	)
 
-	// Learning Repository, Service and Handler
 	learningRepository := repositories.NewLearningRepository(db)
 	learningService := services.NewLearningService(learningRepository)
 	learningHandler := handlers.NewLearningHandler(learningService)
 
+	// New AI Job Handler
+	aiJobHandler := handlers.NewAIJobHandler(db)
+
 	api := router.Group("/api")
+
 	{
 		api.GET("/health", healthHandler.Check)
 
-		// Authentication Routes
 		auth := api.Group("/auth")
+
 		{
 			auth.POST("/register", authHandler.Register)
 			auth.POST("/login", authHandler.Login)
@@ -61,9 +61,12 @@ func SetupRoutes(
 			)
 		}
 
-		// Protected Learning Routes
 		learning := api.Group("/learning")
-		learning.Use(middleware.AuthMiddleware(jwtService))
+
+		learning.Use(
+			middleware.AuthMiddleware(jwtService),
+		)
+
 		{
 			learning.POST(
 				"/notes/:id/share",
@@ -79,6 +82,7 @@ func SetupRoutes(
 				"/shared-notes/:token",
 				learningHandler.GetSharedNote,
 			)
+
 			learning.POST(
 				"/sessions",
 				learningHandler.CreateSession,
@@ -92,6 +96,23 @@ func SetupRoutes(
 			learning.GET(
 				"/notes",
 				learningHandler.GetNotes,
+			)
+
+			// New background AI job routes
+
+			learning.POST(
+				"/ai-jobs",
+				aiJobHandler.Create,
+			)
+
+			learning.GET(
+				"/ai-jobs",
+				aiJobHandler.List,
+			)
+
+			learning.GET(
+				"/ai-jobs/:id",
+				aiJobHandler.Get,
 			)
 		}
 	}
