@@ -26,3 +26,4 @@ venv/
 *.log
 
 ai-engine/test_speech.wav
+frontend/src/App.tsx.backup
