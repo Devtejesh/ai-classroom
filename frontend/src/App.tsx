@@ -24,6 +24,8 @@ type Page = "Home" | "My Learning" | "Library" | "Analytics" | "Settings";
 type ChatMessage = {
   role: "user" | "assistant";
   text: string;
+  files?: File[];
+  feedback?: "up" | "down";
 };
 
 type ViewMode = "both" | "video" | "chat";
@@ -32,6 +34,18 @@ type TranscriptSegment = {
   start: number;
   end: number;
   text: string;
+};
+type AIJob = {
+  id: number;
+  session_id: number;
+  kind: string;
+  status: string;
+  completed_chunks: number;
+  total_chunks: number;
+  next_retry_at: string;
+  error?: string;
+  note_id?: number;
+  results?: (string | TranscriptSegment)[];
 };
 
 type SavedNote = {
@@ -117,6 +131,81 @@ declare global {
   }
 }
 
+function AttachmentPreview({
+  file,
+  onRemove,
+}: {
+  file: File;
+  onRemove?: () => void;
+}) {
+  const [previewUrl, setPreviewUrl] = useState("");
+
+  const isImage =
+    file.type.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(file.name);
+
+  useEffect(() => {
+    if (!isImage) return;
+
+    const url = URL.createObjectURL(file);
+
+    setPreviewUrl(url);
+
+    return () => URL.revokeObjectURL(url);
+  }, [file, isImage]);
+
+  const extension = file.name.split(".").pop()?.toUpperCase() || "FILE";
+
+  const fileSize =
+    file.size >= 1024 * 1024
+      ? `${(file.size / (1024 * 1024)).toFixed(1)} MB`
+      : `${(file.size / 1024).toFixed(1)} KB`;
+
+  return (
+    <div className="chat-file-chip">
+      {isImage && previewUrl ? (
+        <img src={previewUrl} alt={file.name} className="attachment-image" />
+      ) : (
+        <div className="attachment-file-icon">
+          <svg
+            width="23"
+            height="23"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" />
+            <path d="M14 2v6h6M8 13h8M8 17h8" />
+          </svg>
+        </div>
+      )}
+
+      <div className="attachment-details">
+        <span className="attachment-name" title={file.name}>
+          {file.name}
+        </span>
+
+        <span className="attachment-size">
+          {extension} · {fileSize}
+        </span>
+      </div>
+
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          title="Remove attachment"
+          aria-label={`Remove ${file.name}`}
+        >
+          ×
+        </button>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [page, setPage] = useState<Page>("Home");
 
@@ -126,8 +215,8 @@ function App() {
   );
   const [otpStep, setOtpStep] = useState(false);
   const [passwordResetStep, setPasswordResetStep] = useState(false);
-const [resetOTP, setResetOTP] = useState("");
-const [newPassword, setNewPassword] = useState("");
+  const [resetOTP, setResetOTP] = useState("");
+  const [newPassword, setNewPassword] = useState("");
 
   const [otp, setOtp] = useState("");
   const [user, setUser] = useState<User | null>(null);
@@ -165,6 +254,19 @@ const [newPassword, setNewPassword] = useState("");
 
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
+  const [attachments, setAttachments] = useState<File[]>([]);
+  const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
+
+  const attachmentMenuRef = useRef<HTMLDivElement>(null);
+
+  const imageInputRef = useRef<HTMLInputElement>(null);
+
+  const documentInputRef = useRef<HTMLInputElement>(null);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editText, setEditText] = useState("");
+  const chatTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const chatRequestRef = useRef<AbortController | null>(null);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -183,6 +285,9 @@ const [newPassword, setNewPassword] = useState("");
   const [noteTitle, setNoteTitle] = useState("");
   const [noteContent, setNoteContent] = useState("");
   const [notesLoading, setNotesLoading] = useState(false);
+  const [aiJobs, setAIJobs] = useState<AIJob[]>([]);
+
+  const [sourceLanguage, setSourceLanguage] = useState("unknown");
   const [notesError, setNotesError] = useState("");
   const [tutorName, setTutorName] = useState(
     localStorage.getItem("ai_tutor_name") || "Your AI Tutor",
@@ -227,6 +332,37 @@ const [newPassword, setNewPassword] = useState("");
       });
   }, [token]);
 
+  useEffect(() => {
+    const el = chatTextareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+  }, [chatInput, page, viewMode]);
+
+  useEffect(() => {
+    function handleOutsideClick(event: MouseEvent) {
+      if (
+        attachmentMenuRef.current &&
+        !attachmentMenuRef.current.contains(event.target as Node)
+      ) {
+        setAttachmentMenuOpen(false);
+      }
+    }
+
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setAttachmentMenuOpen(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handleOutsideClick);
+    document.addEventListener("keydown", handleEscape);
+
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, []);
   /* Automatically scroll chat */
 
   useEffect(() => {
@@ -246,6 +382,53 @@ const [newPassword, setNewPassword] = useState("");
       );
     });
   }, [page, token]);
+
+  /* Background AI job polling */
+
+  useEffect(() => {
+    if (!token) {
+      setAIJobs([]);
+      return;
+    }
+
+    let active = true;
+    let polling = false;
+
+    const pollJobs = async () => {
+      if (polling) return;
+
+      polling = true;
+
+      try {
+        const response = await fetch(`${API_URL}/learning/ai-jobs`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (!response.ok) return;
+
+        const data = await response.json();
+
+        if (active) {
+          setAIJobs(data.jobs || []);
+        }
+      } catch (error) {
+        console.error("AI job polling failed", error);
+      } finally {
+        polling = false;
+      }
+    };
+
+    void pollJobs();
+
+    const timer = window.setInterval(pollJobs, 5000);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [token]);
 
   /* Cleanup audio and microphone */
 
@@ -339,7 +522,6 @@ const [newPassword, setNewPassword] = useState("");
     }
   }
 
-
   /* Forgot Password */
 
   async function handleForgotPassword() {
@@ -363,18 +545,21 @@ const [newPassword, setNewPassword] = useState("");
       const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        throw new Error(data.error || data.message || "Unable to send reset OTP.");
+        throw new Error(
+          data.error || data.message || "Unable to send reset OTP.",
+        );
       }
 
       setResetOTP("");
       setNewPassword("");
       setPasswordResetStep(true);
       setAuthMessage(
-        data.message || "If your account is eligible, a password reset OTP has been sent."
+        data.message ||
+          "If your account is eligible, a password reset OTP has been sent.",
       );
     } catch (error) {
       setAuthError(
-        error instanceof Error ? error.message : "Unable to send OTP."
+        error instanceof Error ? error.message : "Unable to send OTP.",
       );
     } finally {
       setAuthLoading(false);
@@ -424,10 +609,12 @@ const [newPassword, setNewPassword] = useState("");
       setPassword("");
       setAuthMode("login");
 
-      setAuthMessage(data.message || "Password reset successful. Please log in.");
+      setAuthMessage(
+        data.message || "Password reset successful. Please log in.",
+      );
     } catch (error) {
       setAuthError(
-        error instanceof Error ? error.message : "Password reset failed."
+        error instanceof Error ? error.message : "Password reset failed.",
       );
     } finally {
       setAuthLoading(false);
@@ -532,6 +719,7 @@ const [newPassword, setNewPassword] = useState("");
   /* Logout */
 
   function logout() {
+    resetChat();
     localStorage.removeItem("ai_classroom_token");
 
     setToken("");
@@ -608,6 +796,7 @@ const [newPassword, setNewPassword] = useState("");
 
       setCurrentSessionId(sessionData.session.id);
       setTranscriptSegments(data.segments);
+      setSourceLanguage(data.source_language || "unknown");
 
       setHistory((previous) => [
         `YouTube lesson – ${new Date().toLocaleDateString()}`,
@@ -689,87 +878,172 @@ const [newPassword, setNewPassword] = useState("");
 
   /* Send question to AI Tutor */
 
-  async function sendMessage(text = chatInput) {
-    const value = text.trim();
-
-    if (!value || chatLoading) {
+  function selectAttachments(files: FileList | null) {
+    if (!files) return;
+    const incoming = Array.from(files);
+    if (
+      incoming.some(
+        (file) => !/\.(pdf|docx|txt|md|csv|png|jpe?g|webp)$/i.test(file.name),
+      )
+    ) {
+      setChatNotice(
+        "Unsupported file. Choose PDF, DOCX, TXT, MD, CSV, PNG, JPEG or WEBP.",
+      );
       return;
     }
+    const next = [...attachments, ...incoming];
+    if (
+      next.length > 4 ||
+      next.reduce((sum, file) => sum + file.size, 0) > 10 * 1024 * 1024
+    ) {
+      setChatNotice("Maximum 4 attachments and 10 MB total.");
+      return;
+    }
+    setAttachments(next);
+    setChatNotice("");
+  }
 
-    setMessages((previous) => [
-      ...previous,
-      {
-        role: "user",
-        text: value,
-      },
-    ]);
-
-    setChatInput("");
-    setChatNotice("AI Tutor is thinking...");
-    setChatLoading(true);
-
+  async function copyChatText(text: string) {
     try {
-      const response = await fetch(`${AI_ENGINE_URL}/tutor`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          question: value,
-          segments: transcriptSegments,
-          target_language: getLanguageCode(language),
-        }),
-      });
-
-      const data: {
-        answer?: string;
-        detail?: string;
-      } = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail || "AI Tutor request failed.");
-      }
-
-      const answer = data.answer?.trim();
-
-      if (!answer) {
-        throw new Error("AI Tutor returned an empty answer.");
-      }
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: "assistant",
-          text: answer,
-        },
-      ]);
-
-      setChatNotice("");
-
-      await testTutorVoice(answer);
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error
-          ? error.message
-          : "Unable to connect to AI Tutor.";
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: "assistant",
-          text: `Sorry, ${errorMessage}`,
-        },
-      ]);
-
-      setChatNotice("AI Tutor request failed.");
-    } finally {
-      setChatLoading(false);
+      await navigator.clipboard.writeText(text);
+      setChatNotice("Copied to clipboard.");
+    } catch {
+      setChatNotice(
+        "Clipboard unavailable. Select and copy the message manually.",
+      );
     }
   }
 
-  async function generateLessonNotes() {
-    if (!currentSessionId || !transcriptSegments.length) {
-      setNotesError("Load a lesson before generating notes.");
+  async function shareChatText(text: string) {
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: "AI Classroom", text });
+      } else {
+        await copyChatText(text);
+      }
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        setChatNotice("Sharing failed. Use Copy instead.");
+      }
+    }
+  }
+
+  function resetChat() {
+    chatRequestRef.current?.abort();
+    chatRequestRef.current = null;
+    setChatLoading(false);
+    setMessages([
+      {
+        role: "assistant",
+        text: "Hello! I'm your AI tutor. Ask me anything about your lesson.",
+      },
+    ]);
+    setChatInput("");
+    setAttachments([]);
+    setEditingIndex(null);
+    setChatNotice("");
+  }
+
+  async function sendMessage(
+    text = chatInput,
+    files = attachments,
+    replaceFrom?: number,
+  ) {
+    const value =
+      text.trim() || (files.length ? "Explain the attached files." : "");
+    if (!value || chatRequestRef.current) return;
+    const controller = new AbortController();
+    chatRequestRef.current = controller;
+    const prefix =
+      replaceFrom === undefined ? messages : messages.slice(0, replaceFrom);
+    const next: ChatMessage[] = [
+      ...prefix,
+      { role: "user", text: value, files },
+    ];
+    setMessages(next);
+    if (replaceFrom === undefined) {
+      setChatInput("");
+      setAttachments([]);
+    }
+    setEditingIndex(null);
+    setChatNotice("AI Tutor is thinking...");
+    setChatLoading(true);
+    try {
+      const previous = prefix
+        .slice(-8)
+        .map((m) => `${m.role}: ${m.text}`)
+        .join("\n")
+        .slice(-12000);
+      const question = previous
+        ? `Recent conversation (context only):\n${previous}\n\nCurrent question:\n${value}`
+        : value;
+      const payload = {
+        question,
+        segments: transcriptSegments,
+        target_language: getLanguageCode(language),
+      };
+      let response: Response;
+      if (files.length) {
+        const form = new FormData();
+        form.append("payload", JSON.stringify(payload));
+        files.forEach((file) => form.append("files", file));
+        response = await fetch(`${AI_ENGINE_URL}/tutor/attachments`, {
+          method: "POST",
+          body: form,
+          signal: controller.signal,
+        });
+      } else {
+        response = await fetch(`${AI_ENGINE_URL}/tutor`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      }
+      const data = await response.json();
+      if (!response.ok)
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : "AI Tutor request failed.",
+        );
+      const answer = data.answer?.trim();
+      if (!answer) throw new Error("AI Tutor returned an empty answer.");
+      if (chatRequestRef.current !== controller) return;
+      setMessages([...next, { role: "assistant", text: answer }]);
+      setChatNotice("");
+      await testTutorVoice(answer);
+    } catch (error) {
+      if (chatRequestRef.current !== controller) return;
+      if (controller.signal.aborted) {
+        setChatNotice("Response stopped. You can resend the question.");
+      } else {
+        setChatNotice(
+          error instanceof Error
+            ? error.message
+            : "Unable to connect to AI Tutor.",
+        );
+      }
+    } finally {
+      if (chatRequestRef.current === controller) {
+        chatRequestRef.current = null;
+        setChatLoading(false);
+      }
+    }
+  }
+
+  function regenerateResponse(index: number) {
+    for (let i = index - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        void sendMessage(messages[i].text, messages[i].files || [], i);
+        return;
+      }
+    }
+  }
+
+  async function submitAIJob(kind: "notes" | "translation") {
+    if (!token || !currentSessionId || !transcriptSegments.length) {
+      setNotesError("Load a lesson and login first.");
       return;
     }
 
@@ -777,39 +1051,112 @@ const [newPassword, setNewPassword] = useState("");
     setNotesError("");
 
     try {
-      const response = await fetch(`${AI_ENGINE_URL}/tutor`, {
+      const response = await fetch(`${API_URL}/learning/ai-jobs`, {
         method: "POST",
+
         headers: {
           "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
         },
+
         body: JSON.stringify({
-          question:
-            "Create comprehensive, well-structured study notes for this entire video. Include a suitable title, key concepts, detailed explanations, important points, and practical examples. Use clear Markdown formatting. Do not answer as a conversation; prepare notes for a student to revise later.",
-          segments: transcriptSegments,
+          session_id: currentSessionId,
+          kind: kind,
+          source_language: sourceLanguage,
           target_language: getLanguageCode(language),
+          segments: transcriptSegments,
         }),
       });
 
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.detail || "Unable to generate lesson notes.");
+        throw new Error(data.error || "Unable to queue job");
       }
 
-      if (!data.answer?.trim()) {
-        throw new Error("AI Tutor returned empty notes.");
-      }
+      setChatNotice(`Job ${data.id} queued. Processing in background.`);
 
-      setNoteTitle(`Lesson Notes - ${videoId}`);
-      setNoteContent(data.answer.trim());
+      const jobsResponse = await fetch(`${API_URL}/learning/ai-jobs`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (jobsResponse.ok) {
+        const jobsData = await jobsResponse.json();
+
+        setAIJobs(jobsData.jobs || []);
+      }
     } catch (error) {
       setNotesError(
-        error instanceof Error
-          ? error.message
-          : "Failed to generate lesson notes.",
+        error instanceof Error ? error.message : "Unable to queue job",
       );
     } finally {
       setNotesLoading(false);
+    }
+  }
+
+  async function generateLessonNotes() {
+    await submitAIJob("notes");
+  }
+
+  async function openAIJob(job: AIJob) {
+    try {
+      const response = await fetch(`${API_URL}/learning/ai-jobs/${job.id}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      const data: AIJob = await response.json();
+
+      if (!response.ok || data.status !== "completed" || !data.results) {
+        throw new Error("Result not ready");
+      }
+
+      if (job.kind === "notes") {
+        const content = data.results.join("\n\n---\n\n");
+
+        if (job.session_id !== currentSessionId) {
+          downloadNoteAsText(`AI Lesson Notes - ${job.id}`, content);
+
+          await fetchSavedNotes();
+
+          return;
+        }
+
+        setNoteTitle(`AI Lesson Notes - ${job.id}`);
+
+        setNoteContent(content);
+
+        await fetchSavedNotes();
+      } else {
+        if (job.session_id !== currentSessionId) {
+          const blob = new Blob([JSON.stringify(data.results, null, 2)], {
+            type: "application/json",
+          });
+
+          const url = URL.createObjectURL(blob);
+
+          const link = document.createElement("a");
+
+          link.href = url;
+
+          link.download = `translation-${job.id}.json`;
+
+          link.click();
+
+          URL.revokeObjectURL(url);
+        } else {
+          setTranscriptSegments(data.results as TranscriptSegment[]);
+
+          setChatNotice("Transcript translation completed.");
+        }
+      }
+    } catch (error) {
+      setNotesError(
+        error instanceof Error ? error.message : "Unable to open result",
+      );
     }
   }
 
@@ -972,7 +1319,10 @@ const [newPassword, setNewPassword] = useState("");
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${title.trim() || "lesson-notes"}.txt`.replace(/[\\/:*?"<>|]/g, "-");
+    link.download = `${title.trim() || "lesson-notes"}.txt`.replace(
+      /[\\/:*?"<>|]/g,
+      "-",
+    );
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -1152,7 +1502,9 @@ const [newPassword, setNewPassword] = useState("");
                     maxLength={6}
                     value={resetOTP}
                     onChange={(event) =>
-                      setResetOTP(event.target.value.replace(/\\D/g, "").slice(0, 6))
+                      setResetOTP(
+                        event.target.value.replace(/\\D/g, "").slice(0, 6),
+                      )
                     }
                     placeholder="Enter 6-digit OTP"
                     required
@@ -1290,10 +1642,7 @@ const [newPassword, setNewPassword] = useState("");
 
                 {authMode === "login" && (
                   <div className="forgot-password">
-                    <button
-                      type="button"
-                      onClick={handleForgotPassword}
-                    >
+                    <button type="button" onClick={handleForgotPassword}>
                       Forgot Password?
                     </button>
                   </div>
@@ -1535,21 +1884,31 @@ const [newPassword, setNewPassword] = useState("");
                         </span>
                       </div>
 
-                      <button
-                        className="clear-chat-button"
-                        onClick={() => {
-                          setMessages([
-                            {
-                              role: "assistant",
-                              text: "Hello! I'm your AI tutor. Ask me anything about your lesson.",
-                            },
-                          ]);
-
-                          setChatNotice("");
-                        }}
-                      >
-                        New chat
-                      </button>
+                      <div className="chat-header-actions">
+                        <button
+                          type="button"
+                          className="clear-chat-button"
+                          onClick={() =>
+                            void shareChatText(
+                              messages
+                                .map(
+                                  (m) =>
+                                    `${m.role === "user" ? "You" : "AI Tutor"}: ${m.text}`,
+                                )
+                                .join("\n\n"),
+                            )
+                          }
+                        >
+                          Share chat
+                        </button>
+                        <button
+                          type="button"
+                          className="clear-chat-button"
+                          onClick={resetChat}
+                        >
+                          New chat
+                        </button>
+                      </div>
                     </header>
 
                     <div className="chat-messages" aria-live="polite">
@@ -1569,7 +1928,41 @@ const [newPassword, setNewPassword] = useState("");
 
                           <div className="message-text">
                             {message.role === "user" ? (
-                              <div>{message.text}</div>
+                              editingIndex === index ? (
+                                <div className="chat-edit-box">
+                                  <textarea
+                                    value={editText}
+                                    onChange={(e) =>
+                                      setEditText(e.target.value)
+                                    }
+                                    rows={4}
+                                    aria-label="Edit question"
+                                  />
+                                  <div className="message-actions">
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingIndex(null)}
+                                    >
+                                      Cancel
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={chatLoading || !editText.trim()}
+                                      onClick={() =>
+                                        void sendMessage(
+                                          editText,
+                                          message.files || [],
+                                          index,
+                                        )
+                                      }
+                                    >
+                                      Save &amp; resend
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div>{message.text}</div>
+                              )
                             ) : (
                               <ReactMarkdown
                                 remarkPlugins={[remarkMath]}
@@ -1578,6 +1971,107 @@ const [newPassword, setNewPassword] = useState("");
                                 {message.text}
                               </ReactMarkdown>
                             )}
+                          </div>
+                          {!!message.files?.length && (
+                            <div className="chat-attachment-list">
+                              {message.files.map((file, i) => (
+                                <span key={i} className="chat-file-chip">
+                                  📎 {file.name}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          <div className="message-actions">
+                            <button
+                              type="button"
+                              title="Copy message"
+                              onClick={() => void copyChatText(message.text)}
+                            >
+                              ⧉ Copy
+                            </button>
+                            {message.role === "user" ? (
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={chatLoading}
+                                  onClick={() => {
+                                    setEditingIndex(index);
+                                    setEditText(message.text);
+                                  }}
+                                >
+                                  ✎ Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={chatLoading}
+                                  onClick={() =>
+                                    void sendMessage(
+                                      message.text,
+                                      message.files || [],
+                                      index,
+                                    )
+                                  }
+                                >
+                                  ↻ Resend
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                {messages
+                                  .slice(0, index)
+                                  .some((m) => m.role === "user") && (
+                                  <button
+                                    type="button"
+                                    disabled={chatLoading}
+                                    onClick={() => regenerateResponse(index)}
+                                  >
+                                    ↻ Regenerate
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  disabled={voiceLoading}
+                                  onClick={() =>
+                                    void testTutorVoice(message.text)
+                                  }
+                                >
+                                  🔊 Read
+                                </button>
+                                {(["up", "down"] as const).map((v) => (
+                                  <button
+                                    key={v}
+                                    type="button"
+                                    aria-label={
+                                      v === "up" ? "Helpful" : "Not helpful"
+                                    }
+                                    aria-pressed={message.feedback === v}
+                                    onClick={() =>
+                                      setMessages((prev) =>
+                                        prev.map((m, i) =>
+                                          i === index
+                                            ? {
+                                                ...m,
+                                                feedback:
+                                                  m.feedback === v
+                                                    ? undefined
+                                                    : v,
+                                              }
+                                            : m,
+                                        ),
+                                      )
+                                    }
+                                  >
+                                    {v === "up" ? "👍" : "👎"}
+                                  </button>
+                                ))}
+                              </>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => void shareChatText(message.text)}
+                            >
+                              ↗ Share
+                            </button>
                           </div>
                         </article>
                       ))}
@@ -1609,41 +2103,239 @@ const [newPassword, setNewPassword] = useState("");
                       className="chat-input-row"
                       onSubmit={(event) => {
                         event.preventDefault();
-                        sendMessage();
+                        setAttachmentMenuOpen(false);
+                        void sendMessage();
                       }}
                     >
+                      {/* Hidden image upload input */}
                       <input
-                        value={chatInput}
-                        onChange={(event) => setChatInput(event.target.value)}
-                        placeholder="Ask your question..."
-                        aria-label="Message your AI tutor"
+                        ref={imageInputRef}
+                        type="file"
+                        hidden
+                        multiple
+                        accept=".png,.jpg,.jpeg,.webp"
+                        onChange={(event) => {
+                          selectAttachments(event.target.files);
+                          event.target.value = "";
+                        }}
                       />
 
-                      <button
-                        type="button"
-                        className={`mic-button ${
-                          isListening ? "listening" : ""
-                        }`}
-                        onClick={startVoiceInput}
-                        title={
-                          isListening
-                            ? "Stop voice input"
-                            : "Speak your question"
-                        }
-                        aria-label={
-                          isListening ? "Stop voice input" : "Start voice input"
-                        }
-                      >
-                        🎙
-                      </button>
+                      {/* Hidden document upload input */}
+                      <input
+                        ref={documentInputRef}
+                        type="file"
+                        hidden
+                        multiple
+                        accept=".pdf,.docx,.txt,.md,.csv"
+                        onChange={(event) => {
+                          selectAttachments(event.target.files);
+                          event.target.value = "";
+                        }}
+                      />
 
-                      <button
-                        className="send-button"
-                        aria-label="Send message"
-                        disabled={!chatInput.trim() || chatLoading}
-                      >
-                        ➤
-                      </button>
+                      {/* Selected attachments */}
+                      {attachments.length > 0 && (
+                        <div className="chat-attachment-list">
+                          {attachments.map((file, index) => (
+                            <AttachmentPreview
+                              key={`${file.name}-${index}`}
+                              file={file}
+                              onRemove={() =>
+                                setAttachments((previous) =>
+                                  previous.filter((_, i) => i !== index),
+                                )
+                              }
+                            />
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Message input */}
+                      <textarea
+                        ref={chatTextareaRef}
+                        className="chat-textarea"
+                        rows={1}
+                        value={chatInput}
+                        onChange={(event) => setChatInput(event.target.value)}
+                        placeholder="Ask anything..."
+                        aria-label="Message your AI tutor"
+                        onKeyDown={(event) => {
+                          if (
+                            event.key === "Enter" &&
+                            !event.shiftKey &&
+                            !event.nativeEvent.isComposing
+                          ) {
+                            event.preventDefault();
+                            setAttachmentMenuOpen(false);
+                            void sendMessage();
+                          }
+                        }}
+                      />
+
+                      {/* Bottom toolbar */}
+                      <div className="chat-composer-actions">
+                        {/* Attachment dropdown */}
+                        <div
+                          className="attachment-menu-wrapper"
+                          ref={attachmentMenuRef}
+                        >
+                          <button
+                            type="button"
+                            className="mic-button"
+                            title="Add attachments"
+                            aria-label="Add attachments"
+                            aria-expanded={attachmentMenuOpen}
+                            disabled={chatLoading}
+                            onClick={() =>
+                              setAttachmentMenuOpen((previous) => !previous)
+                            }
+                          >
+                            <svg
+                              width="22"
+                              height="22"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                              strokeLinecap="round"
+                            >
+                              <path d="M12 5v14M5 12h14" />
+                            </svg>
+                          </button>
+
+                          {attachmentMenuOpen && (
+                            <div className="attachment-menu">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setAttachmentMenuOpen(false);
+                                  imageInputRef.current?.click();
+                                }}
+                              >
+                                <svg
+                                  width="20"
+                                  height="20"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="1.7"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                >
+                                  <rect
+                                    x="3"
+                                    y="3"
+                                    width="18"
+                                    height="18"
+                                    rx="3"
+                                  />
+                                  <circle cx="8.5" cy="8.5" r="1.5" />
+                                  <path d="m21 15-5-5L5 21" />
+                                </svg>
+                                Add photos
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setAttachmentMenuOpen(false);
+                                  documentInputRef.current?.click();
+                                }}
+                              >
+                                <svg
+                                  width="20"
+                                  height="20"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="1.7"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                >
+                                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" />
+                                  <path d="M14 2v6h6M8 13h8M8 17h8" />
+                                </svg>
+                                Add PDFs or documents
+                              </button>
+
+                              <div className="attachment-menu-info">
+                                Maximum 4 files · 10 MB total
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        <span className="chat-composer-hint">
+                          {isListening ? "Listening..." : ""}
+                        </span>
+
+                        {/* Microphone */}
+                        <button
+                          type="button"
+                          className={`mic-button ${isListening ? "listening" : ""}`}
+                          onClick={startVoiceInput}
+                          title={isListening ? "Stop recording" : "Voice input"}
+                          aria-label={
+                            isListening ? "Stop recording" : "Voice input"
+                          }
+                          aria-pressed={isListening}
+                        >
+                          <svg
+                            width="21"
+                            height="21"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
+                            <rect x="9" y="2" width="6" height="13" rx="3" />
+                            <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M9 22h6" />
+                          </svg>
+                        </button>
+
+                        {/* Send or stop */}
+                        {chatLoading ? (
+                          <button
+                            type="button"
+                            className="send-button"
+                            title="Stop response"
+                            aria-label="Stop response"
+                            onClick={() => chatRequestRef.current?.abort()}
+                          >
+                            <svg
+                              width="17"
+                              height="17"
+                              viewBox="0 0 24 24"
+                              fill="currentColor"
+                            >
+                              <rect x="5" y="5" width="14" height="14" rx="2" />
+                            </svg>
+                          </button>
+                        ) : (
+                          <button
+                            type="submit"
+                            className="send-button"
+                            title="Send message"
+                            aria-label="Send message"
+                            disabled={!chatInput.trim() && !attachments.length}
+                          >
+                            <svg
+                              width="21"
+                              height="21"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2.2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <path d="M12 19V5M5 12l7-7 7 7" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
                     </form>
 
                     <div className="chat-footer">
@@ -1699,16 +2391,114 @@ const [newPassword, setNewPassword] = useState("");
                       onChange={(e) => setNoteTitle(e.target.value)}
                       placeholder="Enter note title"
                     />
-
                     <button
                       className="secondary-button"
                       onClick={generateLessonNotes}
                       disabled={notesLoading}
                     >
                       {notesLoading
-                        ? "Generating Notes..."
+                        ? "Submitting Job..."
                         : "✨ Generate AI Notes"}
                     </button>
+
+                    <button
+                      className="secondary-button"
+                      disabled={notesLoading}
+                      onClick={() => void submitAIJob("translation")}
+                    >
+                      Translate Transcript in Background
+                    </button>
+
+                    <section className="background-jobs">
+                      <h3>Background AI Jobs</h3>
+
+                      {aiJobs.length === 0 && (
+                        <p>No background jobs available.</p>
+                      )}
+
+                      {aiJobs.map((job) => {
+                        const progress =
+                          job.total_chunks > 0
+                            ? Math.round(
+                                (job.completed_chunks / job.total_chunks) * 100,
+                              )
+                            : 0;
+
+                        return (
+                          <div className="history-item" key={job.id}>
+                            <strong>
+                              Job #{job.id} —{" "}
+                              {job.kind === "notes"
+                                ? "AI Notes"
+                                : "Translation"}
+                            </strong>
+
+                            <p>
+                              Status:{" "}
+                              {job.status.replaceAll("_", " ").toUpperCase()}
+                            </p>
+
+                            <progress
+                              value={job.completed_chunks}
+                              max={job.total_chunks || 1}
+                              style={{ width: "100%" }}
+                            />
+
+                            <p>
+                              {job.completed_chunks}/{job.total_chunks} chunks
+                              completed — {progress}%
+                            </p>
+
+                            {job.status === "queued" && (
+                              <p>Waiting for the background worker.</p>
+                            )}
+
+                            {job.status === "processing" && (
+                              <p>AI is processing your video.</p>
+                            )}
+
+                            {job.status === "waiting_for_quota" && (
+                              <div>
+                                <p>
+                                  API quota exhausted. Your progress is safely
+                                  saved.
+                                </p>
+
+                                <p>
+                                  Next retry:{" "}
+                                  {new Date(job.next_retry_at).toLocaleString()}
+                                </p>
+
+                                <p>Processing will resume automatically.</p>
+                              </div>
+                            )}
+
+                            {job.status === "failed" && (
+                              <p className="error-message">
+                                {job.error || "Job processing failed."}
+                              </p>
+                            )}
+
+                            {job.status === "completed" && (
+                              <div>
+                                <p>Processing completed successfully.</p>
+
+                                {job.kind === "notes" && (
+                                  <p>Notes automatically saved to Library.</p>
+                                )}
+
+                                <button
+                                  className="secondary-button"
+                                  onClick={() => void openAIJob(job)}
+                                >
+                                  Open Result
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </section>
 
                     {notesError && (
                       <p className="error-message">{notesError}</p>
@@ -1737,7 +2527,8 @@ const [newPassword, setNewPassword] = useState("");
                           </ReactMarkdown>
                         ) : (
                           <p className="notes-preview-placeholder">
-                            Your formatted notes will appear here as you type or generate them.
+                            Your formatted notes will appear here as you type or
+                            generate them.
                           </p>
                         )}
                       </div>
@@ -1749,14 +2540,18 @@ const [newPassword, setNewPassword] = useState("");
                     <div className="notes-download-actions">
                       <button
                         className="secondary-button"
-                        onClick={() => downloadNoteAsText(noteTitle, noteContent)}
+                        onClick={() =>
+                          downloadNoteAsText(noteTitle, noteContent)
+                        }
                         disabled={!noteTitle.trim() || !noteContent.trim()}
                       >
                         Download TXT
                       </button>
                       <button
                         className="secondary-button"
-                        onClick={() => downloadNoteAsPDF(noteTitle, noteContent)}
+                        onClick={() =>
+                          downloadNoteAsPDF(noteTitle, noteContent)
+                        }
                         disabled={!noteTitle.trim() || !noteContent.trim()}
                       >
                         Save as PDF
@@ -1782,13 +2577,17 @@ const [newPassword, setNewPassword] = useState("");
                         <div className="notes-download-actions">
                           <button
                             className="secondary-button"
-                            onClick={() => downloadNoteAsText(item.title, item.content)}
+                            onClick={() =>
+                              downloadNoteAsText(item.title, item.content)
+                            }
                           >
                             Download TXT
                           </button>
                           <button
                             className="secondary-button"
-                            onClick={() => downloadNoteAsPDF(item.title, item.content)}
+                            onClick={() =>
+                              downloadNoteAsPDF(item.title, item.content)
+                            }
                           >
                             Save as PDF
                           </button>
